@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "stm32l4xx_nucleo.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -101,7 +102,10 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-
+    BSP_LED_On(LED_GREEN);
+    HAL_Delay(500);
+    BSP_LED_Off(LED_GREEN);
+    HAL_Delay(500);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
