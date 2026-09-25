@@ -107,6 +107,8 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  float temp_c;
+  
   while (1)
   {
 
@@ -272,7 +274,89 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+float TMP3_ReadTemp(void)
 
+{
+
+  HAL_StatusTypeDef ret;
+
+  uint8_t buf[2];
+
+  int16_t val;
+
+  float temp_c;
+
+  /* TODO:
+  Declare the following using #define or constant
+  -
+  I2C device address (define as TMP3_ADDR)
+  -
+  Temperature register address (define as REG_TEMP)
+  */
+
+  // Specify which register is to be read
+  buf[0] = REG_TEMP;
+  ret = HAL_I2C_Master_Transmit(&hi2c1,
+
+                                TMP3_ADDR,
+
+                                buf,
+
+                                1,
+                                7
+
+                                HAL_MAX_DELAY);
+
+  if (ret != HAL_OK)
+
+  {
+    return -999.0f;
+    // communication error with sensor
+  }
+
+  // Read two bytes from the temperature register
+  ret = HAL_I2C_Master_Receive(&hi2c1,
+
+                               TMP3_ADDR,
+
+                               buf,
+
+                               2,
+
+                               HAL_MAX_DELAY);
+
+  if (ret != HAL_OK)
+
+  {
+
+    return -999.0f;
+  }
+
+  /* TODO:
+  Convert the bytes read into absolute values and print */
+  // combine the bytes into val
+  val = ;
+  // Convert to 2's complement, since temperature can be negative
+  if ()
+  {
+  }
+
+  // Convert the sensor output into absolute values using temperature resolution(°C / bit)
+
+      temp_c = val * ______________f;
+
+  // convert temperature to decimal format
+
+  temp_c *= 100;
+
+  sprintf((char *)buf, "%u.%u C\r\n",
+
+          ((unsigned int)temp_c / 100),
+
+          ((unsigned int)temp_c % 100));
+
+  return temp_c;
+}
 /* USER CODE END 4 */
 
 /**
