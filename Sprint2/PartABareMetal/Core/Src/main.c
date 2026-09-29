@@ -21,7 +21,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdio.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -31,7 +32,9 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define TMP3_ADDR 0x48 << 1 // I2C address of TMP3 sensor
+#define REG_TEMP 0x00      // Register address for temperature data
+#define TMP3_RESOLUTION 0.0625f // Temperature resolution in °C/bit 
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -56,7 +59,7 @@ static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
-
+float TEMP3_ReadTemp(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -108,12 +111,18 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   float temp_c;
-  
+  char buf[50];
   while (1)
   {
 
     /* USER CODE END WHILE */
 
+    temp_c = TEMP3_ReadTemp();
+    sprintf(buf, "Temperature: %.2f C\r\n", temp_c);
+    HAL_UART_Transmit(&huart2, (uint8_t*)buf, strlen(buf), HAL_MAX_DELAY);
+    HAL_Delay(1000); // Wait for 1 second
+    
+    
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
@@ -274,7 +283,7 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-float TMP3_ReadTemp(void)
+float TEMP3_ReadTemp(void)
 
 {
 
@@ -293,19 +302,11 @@ float TMP3_ReadTemp(void)
   -
   Temperature register address (define as REG_TEMP)
   */
-
+  
+  
   // Specify which register is to be read
   buf[0] = REG_TEMP;
-  ret = HAL_I2C_Master_Transmit(&hi2c1,
-
-                                TMP3_ADDR,
-
-                                buf,
-
-                                1,
-                                7
-
-                                HAL_MAX_DELAY);
+  ret = HAL_I2C_Master_Transmit(&hi2c1,TMP3_ADDR,buf,1,HAL_MAX_DELAY);
 
   if (ret != HAL_OK)
 
@@ -326,35 +327,25 @@ float TMP3_ReadTemp(void)
                                HAL_MAX_DELAY);
 
   if (ret != HAL_OK)
-
   {
-
     return -999.0f;
   }
 
   /* TODO:
   Convert the bytes read into absolute values and print */
   // combine the bytes into val
-  val = ;
+  val = (uint16_t)buf[0] << 8 | buf[1];
   // Convert to 2's complement, since temperature can be negative
-  if ()
+  if (val & 0x8000)
   {
+    val = -((val ^ 0xFFFF) + 1);
   }
 
   // Convert the sensor output into absolute values using temperature resolution(°C / bit)
 
-      temp_c = val * ______________f;
+  temp_c = val/256.0f;
 
-  // convert temperature to decimal format
-
-  temp_c *= 100;
-
-  sprintf((char *)buf, "%u.%u C\r\n",
-
-          ((unsigned int)temp_c / 100),
-
-          ((unsigned int)temp_c % 100));
-
+  //sprintf((char*)buf,"%u.%u C\r\n",((unsigned int)temp_c / 100),((unsigned int)temp_c % 100));
   return temp_c;
 }
 /* USER CODE END 4 */
