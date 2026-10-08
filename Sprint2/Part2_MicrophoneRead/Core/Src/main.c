@@ -233,7 +233,7 @@ static void MX_SAI2_Init(void)
   hsai_BlockA2.Init.OutputDrive = SAI_OUTPUTDRIVE_ENABLE;
   hsai_BlockA2.Init.NoDivider = SAI_MASTERDIVIDER_ENABLE;
   hsai_BlockA2.Init.FIFOThreshold = SAI_FIFOTHRESHOLD_EMPTY;
-  hsai_BlockA2.Init.AudioFrequency = SAI_AUDIO_FREQUENCY_16K;
+  hsai_BlockA2.Init.AudioFrequency = SAI_AUDIO_FREQUENCY_8K;
   hsai_BlockA2.Init.SynchroExt = SAI_SYNCEXT_DISABLE;
   hsai_BlockA2.Init.MonoStereoMode = SAI_STEREOMODE;
   hsai_BlockA2.Init.CompandingMode = SAI_NOCOMPANDING;
@@ -319,10 +319,10 @@ void StartMicRead(void *argument)
 {
   /* USER CODE BEGIN 5 */
   /* Infinite loop */
-  uint8_t buf[16*4];
+  uint32_t buf[16];
   for(;;)
   {
-    HAL_SAI_Receive(&hsai_BlockA2, buf, 16, HAL_MAX_DELAY);
+    HAL_SAI_Receive(&hsai_BlockA2, (uint8_t *)buf, 16, HAL_MAX_DELAY);
     osDelay(450);
   }
   /* USER CODE END 5 */
