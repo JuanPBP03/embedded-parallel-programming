@@ -42,6 +42,8 @@
 #define AUDIO_BUF_SIZE 512
 #define FFT_LENGTH AUDIO_BUF_SIZE
 #define FFT_MAG_LEN (FFT_LENGTH/2)
+#define SAMPLE_RATE 44100.0f
+#define FFT_RESOLUTION (SAMPLE_RATE/FFT_LENGTH) // 44100/512 = 86.1328125 Hz
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -72,6 +74,7 @@ float32_t fft_output[FFT_LENGTH];
 float32_t fft_magnitude[FFT_MAG_LEN];
 
 TaskHandle_t processTaskHandle;
+TaskHandle_t microphoneTaskHandle;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -152,8 +155,8 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
-  xTaskCreate(MicrophoneStream, "Microphone Stream", 128, NULL, 1, NULL);
-  xTaskCreate(Process_Audio, "Audio FFT", 512, NULL, 1, &processTaskHandle);
+  xTaskCreate(MicrophoneStream, "Microphone Stream", 512, NULL, 1, &microphoneTaskHandle);
+  xTaskCreate(Process_Audio, "Audio FFT", 1024, NULL, 1, &processTaskHandle);
 
 
 
@@ -355,6 +358,7 @@ void MicrophoneStream(void *argument){
     HAL_SAI_Receive(&hsai_BlockA2, (uint8_t *)audio_samples, AUDIO_BUF_SIZE, HAL_MAX_DELAY);
     xTaskNotifyGive(processTaskHandle);
     vTaskDelay(pdMS_TO_TICKS(400));
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
   }
 }
 
@@ -377,7 +381,21 @@ void Process_Audio(void *argument){
       arm_cmplx_mag_f32(&fft_output[2], &fft_magnitude[1], FFT_MAG_LEN-1);
 
       fft_magnitude[0] = fabsf(fft_output[0]); // fft_output[0] is already real
+      
+      for(uint32_t i=8;i<15;i++)
+      {
+        if(fft_magnitude[i] > 0.1f)
+        {
+          char buf[50];
+          snprintf(buf, sizeof(buf), "Frequency Bin %0.2fHz: Magnitude: %f\r\n", (float)i*FFT_RESOLUTION, fft_magnitude[i]);
+          HAL_UART_Transmit(&huart2, (uint8_t*)buf, strlen(buf), HAL_MAX_DELAY);
+          
+
+        }
+
+      }
     }
+    xTaskNotifyGive(microphoneTaskHandle);
   }
 }
 
@@ -399,7 +417,7 @@ void traceTaskSwitch(void)
   * @retval None
   */
 /* USER CODE END Header_StartDefaultTask */
-void StartDefaultTask(void *argument)
+__weak void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
   /* Infinite loop */
