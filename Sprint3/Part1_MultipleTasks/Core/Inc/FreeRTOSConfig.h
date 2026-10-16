@@ -165,8 +165,8 @@ standard names. */
 
 /* USER CODE BEGIN Defines */
 /* Section where parameter definitions can be added (for instance, to override default ones in FreeRTOS.h) */
-//void traceTaskSwitch(void);
-//#define traceTASK_SWITCHED_IN() traceTaskSwitch()
+void traceTaskSwitch(void);
+#define traceTASK_SWITCHED_IN() traceTaskSwitch()
 /* USER CODE END Defines */
 
 #endif /* FREERTOS_CONFIG_H */

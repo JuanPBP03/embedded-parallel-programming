@@ -23,6 +23,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "FreeRTOS.h"
+#include "cmsis_os2.h"
 #include "projdefs.h"
 #include "stm32l4xx_hal_def.h"
 #include "stm32l4xx_nucleo.h"
@@ -151,14 +152,12 @@ int main(void)
 
   /* Create the thread(s) */
   /* creation of defaultTask */
-  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+  //defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
   xTaskCreate(MicrophoneStream, "Microphone Stream", 512, NULL, 1, &microphoneTaskHandle);
   xTaskCreate(Process_Audio, "Audio FFT", 1024, NULL, 1, &processTaskHandle);
-
-
 
   /* USER CODE END RTOS_THREADS */
 
@@ -381,19 +380,8 @@ void Process_Audio(void *argument){
       arm_cmplx_mag_f32(&fft_output[2], &fft_magnitude[1], FFT_MAG_LEN-1);
 
       fft_magnitude[0] = fabsf(fft_output[0]); // fft_output[0] is already real
+
       
-      for(uint32_t i=8;i<15;i++)
-      {
-        if(fft_magnitude[i] > 0.1f)
-        {
-          char buf[50];
-          snprintf(buf, sizeof(buf), "Frequency Bin %0.2fHz: Magnitude: %f\r\n", (float)i*FFT_RESOLUTION, fft_magnitude[i]);
-          HAL_UART_Transmit(&huart2, (uint8_t*)buf, strlen(buf), HAL_MAX_DELAY);
-          
-
-        }
-
-      }
     }
     xTaskNotifyGive(microphoneTaskHandle);
   }
