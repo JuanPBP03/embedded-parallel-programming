@@ -63,8 +63,9 @@ void Error_Handler(void);
 #define USART_TX_GPIO_Port GPIOA
 #define USART_RX_Pin GPIO_PIN_3
 #define USART_RX_GPIO_Port GPIOA
-#define SDMMC1_ChipDetect_Pin GPIO_PIN_9
-#define SDMMC1_ChipDetect_GPIO_Port GPIOC
+#define SD_DETECT_Pin GPIO_PIN_9
+#define SD_DETECT_GPIO_Port GPIOC
+#define SD_DETECT_EXTI_IRQn EXTI9_5_IRQn
 #define TMS_Pin GPIO_PIN_13
 #define TMS_GPIO_Port GPIOA
 #define TCK_Pin GPIO_PIN_14

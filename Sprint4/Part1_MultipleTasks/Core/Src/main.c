@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "bsp_driver_sd.h"
 #include "cmsis_os.h"
 #include "fatfs.h"
 
@@ -36,6 +37,7 @@
 #include "string.h"
 #include "stdio.h"
 #include "queue.h"
+#include "stdarg.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -45,11 +47,12 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define DMA_BUF_SIZE                       1024
+#define DMA_BUF_SIZE                       512
 #define AUDIO_BLOCK_LEN_WORDS             (DMA_BUF_SIZE/2)
 #define AUDIO_BLOCK_SIZE_BYTES            (AUDIO_BLOCK_LEN_WORDS*4)
 #define FFT_LENGTH                         AUDIO_BLOCK_LEN_WORDS
 #define FFT_MAG_LEN                       (FFT_LENGTH/2)
+#define FFT_MAG_LEN_BYTES                 (FFT_MAG_LEN*4)
 #define SAMPLE_RATE                        44100.0f
 #define FFT_RESOLUTION                    (SAMPLE_RATE/FFT_LENGTH) // 44100/512 = 86.1328125 Hz
 
@@ -72,7 +75,7 @@ SAI_HandleTypeDef hsai_BlockA2;
 DMA_HandleTypeDef hdma_sai2_a;
 
 SD_HandleTypeDef hsd1;
-DMA_HandleTypeDef hdma_sdmmc1_tx;
+DMA_HandleTypeDef hdma_sdmmc1;
 
 UART_HandleTypeDef huart2;
 
@@ -85,8 +88,11 @@ const osThreadAttr_t defaultTask_attributes = {
 };
 /* USER CODE BEGIN PV */
 
-FATFS filesystem;
-char filesystemPath[4];
+extern uint8_t retSD;    /* Return value for SD */
+extern char SDPath[4];   /* SD logical drive path */
+extern FATFS SDFatFS;    /* File system object for SD logical drive */
+extern FIL SDFile;       /* File object for SD */
+char writeBuff[128] __attribute__((aligned(4)));
 
 
 int32_t raw_audio_samples[AUDIO_BLOCK_LEN_WORDS];
@@ -98,21 +104,16 @@ float32_t fft_input[FFT_LENGTH];
 float32_t fft_output[FFT_LENGTH];
 float32_t fft_magnitude[FFT_MAG_LEN];
 
-TaskHandle_t processTaskHandle;
 TaskHandle_t AudioProcessingTaskHandle;
+TaskHandle_t SDCardWriteTaskHandle;
 
-typedef enum {
-  AUDIO_HALF_BUF_READY,
-  AUDIO_FULL_BUF_READY
-}MicrophoneEvent_t;
-
-StaticQueue_t xAudioQueue;
+static StaticQueue_t xAudioQueue;
 QueueHandle_t xhAudioQueue;
 uint8_t AudioQueueStorageBuffer[AUDIO_QUEUE_SIZE];
 
-StaticQueue_t xFFTQueue;
+static StaticQueue_t xFFTQueue;
 QueueHandle_t xhFFTQueue;
-uint8_t FFTQueueStorageBuffer[FFT_MAG_LEN];
+uint8_t FFTQueueStorageBuffer[FFT_QUEUE_LEN*FFT_MAG_LEN_BYTES];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -126,12 +127,147 @@ void StartDefaultTask(void *argument);
 
 /* USER CODE BEGIN PFP */
 void vAudioProcessingTask(void *argument);
+void vSDCardWriteTask(void *argument);
 void traceTaskSwitch(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+void UART_Printf(const char* fmt, ...) {
+    char buff[256];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buff, sizeof(buff), fmt, args);
+    HAL_UART_Transmit(&huart2, (uint8_t*)buff, strlen(buff), HAL_MAX_DELAY);
+    va_end(args);
+}
 
+void init() {
+    UART_Printf("Ready!\r\n");
+
+    // mount the default drive
+    retSD = f_mount(&SDFatFS, (TCHAR const*)SDPath, 0);
+    if(retSD != FR_OK) {
+        UART_Printf("f_mount() failed, retSD = %d\r\n", retSD);
+        return;
+    }
+
+    UART_Printf("f_mount() done!\r\n");
+
+    uint32_t freeClust;
+    FATFS* fs_ptr = &SDFatFS;
+    retSD = f_getfree((TCHAR const*)SDPath, &freeClust, &fs_ptr); // Warning! This fills SDFatFS.n_fatent and SDFatFS.csize!
+    if(retSD != FR_OK) {
+        UART_Printf("f_getfree() failed, retSD = %d\r\n", retSD);
+        return;
+    }
+
+    UART_Printf("f_getfree() done!\r\n");
+
+    uint32_t totalBlocks = (SDFatFS.n_fatent - 2) * SDFatFS.csize;
+    uint32_t freeBlocks = freeClust * SDFatFS.csize;
+
+    UART_Printf("Total blocks: %lu (%lu Mb)\r\n", totalBlocks, totalBlocks / 2000);
+    UART_Printf("Free blocks: %lu (%lu Mb)\r\n", freeBlocks, freeBlocks / 2000);
+
+    DIR dir;
+    retSD = f_opendir(&dir, "/");
+    if(retSD != FR_OK) {
+        UART_Printf("f_opendir() failed, retSD = %d\r\n", retSD);
+        return;
+    }
+
+    FILINFO fileInfo;
+    uint32_t totalFiles = 0;
+    uint32_t totalDirs = 0;
+    UART_Printf("--------\r\nRoot directory:\r\n");
+    for(;;) {
+        retSD = f_readdir(&dir, &fileInfo);
+        if((retSD != FR_OK) || (fileInfo.fname[0] == '\0')) {
+            break;
+        }
+        
+        if(fileInfo.fattrib & AM_DIR) {
+            UART_Printf("  DIR  %s\r\n", fileInfo.fname);
+            totalDirs++;
+        } else {
+            UART_Printf("  FILE %s\r\n", fileInfo.fname);
+            totalFiles++;
+        }
+    }
+
+    UART_Printf("(total: %lu dirs, %lu files)\r\n--------\r\n", totalDirs, totalFiles);
+
+    retSD = f_closedir(&dir);
+    if(retSD != FR_OK) {
+        UART_Printf("f_closedir() failed, retSD = %d\r\n", retSD);
+        return;
+    }
+
+    UART_Printf("Writing to log.txt...\r\n");
+
+    snprintf(writeBuff, sizeof(writeBuff), "Total blocks: %lu (%lu Mb); Free blocks: %lu (%lu Mb)\r\n",
+        totalBlocks, totalBlocks / 2000,
+        freeBlocks, freeBlocks / 2000);
+
+    retSD = f_open(&SDFile, "log.txt", FA_OPEN_APPEND | FA_WRITE);
+    if(retSD != FR_OK) {
+        UART_Printf("f_open() failed, retSD = %d\r\n", retSD);
+        return;
+    }
+
+    unsigned int bytesToWrite = strlen(writeBuff);
+    unsigned int bytesWritten;
+    retSD = f_write(&SDFile, writeBuff, bytesToWrite, &bytesWritten);
+    if(retSD != FR_OK) {
+        UART_Printf("f_write() failed, retSD = %d\r\n", retSD);
+        return;
+    }
+
+    if(bytesWritten < bytesToWrite) {
+        UART_Printf("WARNING! Disk is full, bytesToWrite = %lu, bytesWritten = %lu\r\n", bytesToWrite, bytesWritten);
+    }
+
+    retSD = f_close(&SDFile);
+    if(retSD != FR_OK) {
+        UART_Printf("f_close() failed, retSD = %d\r\n", retSD);
+        return;
+    }
+
+    UART_Printf("Reading file...\r\n");
+    FIL msgFile;
+    retSD = f_open(&msgFile, "log.txt", FA_READ);
+    if(retSD != FR_OK) {
+        UART_Printf("f_open() failed, retSD = %d\r\n", retSD);
+        return;
+    }
+
+    char readBuff[128];
+    unsigned int bytesRead;
+    retSD = f_read(&msgFile, readBuff, sizeof(readBuff)-1, &bytesRead);
+    if(retSD != FR_OK) {
+        UART_Printf("f_read() failed, retSD = %d\r\n", retSD);
+        return;
+    }
+
+    readBuff[bytesRead] = '\0';
+    UART_Printf("```\r\n%s\r\n```\r\n", readBuff);
+
+    retSD = f_close(&msgFile);
+    if(retSD != FR_OK) {
+        UART_Printf("f_close() failed, retSD = %d\r\n", retSD);
+        return;
+    }
+
+    // Unmount
+    retSD = f_mount(NULL, "", 0);
+    if(retSD != FR_OK) {
+        UART_Printf("Unmount failed, retSD = %d\r\n", retSD);
+        return;
+    }
+
+    UART_Printf("Done!\r\n");
+}
 /* USER CODE END 0 */
 
 /**
@@ -142,7 +278,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+  
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -200,8 +336,8 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
-  xTaskCreate(vAudioProcessingTask, "Audio Processing", 512, NULL, 1, &AudioProcessingTaskHandle);
-
+  xTaskCreate(vAudioProcessingTask, "Audio Processing", 1024, NULL, 2, &AudioProcessingTaskHandle);
+  xTaskCreate(vSDCardWriteTask, "SD Card Write", 512, NULL, 1, &SDCardWriteTaskHandle);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -294,7 +430,7 @@ static void MX_SAI2_Init(void)
   hsai_BlockA2.Init.Synchro = SAI_ASYNCHRONOUS;
   hsai_BlockA2.Init.OutputDrive = SAI_OUTPUTDRIVE_DISABLE;
   hsai_BlockA2.Init.NoDivider = SAI_MASTERDIVIDER_ENABLE;
-  hsai_BlockA2.Init.FIFOThreshold = SAI_FIFOTHRESHOLD_HF;
+  hsai_BlockA2.Init.FIFOThreshold = SAI_FIFOTHRESHOLD_EMPTY;
   hsai_BlockA2.Init.AudioFrequency = SAI_AUDIO_FREQUENCY_44K;
   hsai_BlockA2.Init.SynchroExt = SAI_SYNCEXT_DISABLE;
   hsai_BlockA2.Init.MonoStereoMode = SAI_MONOMODE;
@@ -329,8 +465,8 @@ static void MX_SDMMC1_SD_Init(void)
   hsd1.Init.ClockBypass = SDMMC_CLOCK_BYPASS_DISABLE;
   hsd1.Init.ClockPowerSave = SDMMC_CLOCK_POWER_SAVE_DISABLE;
   hsd1.Init.BusWide = SDMMC_BUS_WIDE_1B;
-  hsd1.Init.HardwareFlowControl = SDMMC_HARDWARE_FLOW_CONTROL_DISABLE;
-  hsd1.Init.ClockDiv = 0;
+  hsd1.Init.HardwareFlowControl = SDMMC_HARDWARE_FLOW_CONTROL_ENABLE;
+  hsd1.Init.ClockDiv = 8;
   /* USER CODE BEGIN SDMMC1_Init 2 */
 
   /* USER CODE END SDMMC1_Init 2 */
@@ -386,9 +522,9 @@ static void MX_DMA_Init(void)
   /* DMA1_Channel6_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel6_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel6_IRQn);
-  /* DMA2_Channel4_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA2_Channel4_IRQn, 5, 0);
-  HAL_NVIC_EnableIRQ(DMA2_Channel4_IRQn);
+  /* DMA2_Channel5_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Channel5_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Channel5_IRQn);
 
 }
 
@@ -427,13 +563,16 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : SDMMC1_ChipDetect_Pin */
-  GPIO_InitStruct.Pin = SDMMC1_ChipDetect_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(SDMMC1_ChipDetect_GPIO_Port, &GPIO_InitStruct);
+  /*Configure GPIO pin : SD_DETECT_Pin */
+  GPIO_InitStruct.Pin = SD_DETECT_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(SD_DETECT_GPIO_Port, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+
   HAL_NVIC_SetPriority(EXTI15_10_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
@@ -445,6 +584,8 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 void vAudioProcessingTask(void *argument){
+  
+  HAL_SAI_Receive_DMA(&hsai_BlockA2, (uint8_t*)DMA_buf, DMA_BUF_SIZE);
   for(;;)
   {
     xQueueReceive(xhAudioQueue, raw_audio_samples, portMAX_DELAY);
@@ -472,20 +613,26 @@ void vAudioProcessingTask(void *argument){
 }
 
 void vSDCardWriteTask(void *argument){
-
+  for(;;)
+  {
+    if(BSP_SD_IsDetected()){
+      init();
+    }
+    f_mount(NULL, "", 0);
+  }
 }
 
 void HAL_SAI_RxHalfCpltCallback(SAI_HandleTypeDef *hsai){
   BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
-  xQueueSendFromISR(xhAudioQueue, &raw_audio_samples[0], &xHigherPriorityTaskWoken);
+  xQueueSendFromISR(xhAudioQueue, &DMA_buf[0], &xHigherPriorityTaskWoken);
   portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
 void HAL_SAI_RxCpltCallback(SAI_HandleTypeDef *hsai){
   BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
-  xQueueSendFromISR(xhAudioQueue, &raw_audio_samples[AUDIO_BLOCK_LEN_WORDS], &xHigherPriorityTaskWoken);
+  xQueueSendFromISR(xhAudioQueue, (DMA_buf+AUDIO_BLOCK_LEN_WORDS), &xHigherPriorityTaskWoken);
   portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
@@ -498,14 +645,54 @@ void traceTaskSwitch(void)
   HAL_UART_Transmit(&huart2, buf1, strlen((char*)buf1), HAL_MAX_DELAY);
 }
 
-uint8_t BSP_SD_IsDetected(void){
-  __IO Status = SD_PRESENT;
-
-  Status = ~HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_9); // LOW = CARD DETECTED
-
-  return Status;
+uint8_t BSP_SD_ReadBlocks_DMA(uint32_t *pData, uint32_t ReadAddr, uint32_t NumOfBlocks)
+{
+ uint8_t sd_state = MSD_OK;
+ // Since we are only using 1 DMA channel for SDMMC
+ // Change DMA direction before calling SD Read
+ // Direction can only be changed when DMA is disabled
+ 
+ __HAL_DMA_DISABLE(hsd1.hdmarx);
+ hsd1.hdmarx->Init.Direction = DMA_PERIPH_TO_MEMORY;
+ hsd1.hdmarx->Instance->CCR &= ~DMA_CCR_DIR;
+ 
+ /* Read block(s) in DMA transfer mode */
+ if (HAL_SD_ReadBlocks_DMA(&hsd1, (uint8_t *)pData, ReadAddr, NumOfBlocks) != HAL_OK)
+ {
+ sd_state = MSD_ERROR;
+ }
+ 
+ return sd_state;
 }
 
+uint8_t BSP_SD_WriteBlocks_DMA(uint32_t *pData, uint32_t WriteAddr, uint32_t NumOfBlocks)
+{
+ uint8_t sd_state = MSD_OK;
+ 
+ // Since we are only using 1 DMA channel for SDMMC
+ // Change DMA direction before calling SD Read
+ // Direction can only be changed when DMA is disabled
+ 
+ __HAL_DMA_DISABLE(hsd1.hdmatx);
+ hsd1.hdmatx->Init.Direction = DMA_MEMORY_TO_PERIPH;
+ hsd1.hdmatx->Instance->CCR |= (uint32_t)DMA_CCR_DIR;
+ 
+ /* Write block(s) in DMA transfer mode */
+ if (HAL_SD_WriteBlocks_DMA(&hsd1, (uint8_t *)pData, WriteAddr, NumOfBlocks) != HAL_OK)
+ {
+ sd_state = MSD_ERROR;
+ }
+ 
+ return sd_state;
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if(SD_DETECT_Pin == GPIO_Pin)
+  {
+
+  }
+}
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
