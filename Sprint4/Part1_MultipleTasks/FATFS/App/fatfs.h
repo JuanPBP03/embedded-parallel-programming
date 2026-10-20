@@ -39,7 +39,24 @@ extern FIL SDFile; /* File object for SD */
 void MX_FATFS_Init(void);
 
 /* USER CODE BEGIN Prototypes */
-
+void GetNextFileName(char *filename);
+#pragma pack(push, 1)
+typedef struct {
+    char        riff_chunk_id[4];   // "RIFF"
+    uint32_t    chunk_size;         // 36 + sub_chunk_2_size
+    char        format[4];          // "WAVE"
+    char        fmt_chunk_id[4];    // "fmt "
+    uint32_t    fmt_chunk_size;     // 16 for PCM
+    uint16_t    audio_format;       // 1 for PCM
+    uint16_t    num_channels;       // 1 = Mono, 2 = Stereo
+    uint32_t    sample_rate;        // e.g., 16000, 44100
+    uint32_t    byte_rate;          // sample_rate * num_channels * (bits_per_sample/8)
+    uint16_t    block_align;        // num_channels * (bits_per_sample/8)
+    uint16_t    bits_per_sample;    // 16 bits or 32 bits
+    char        data_chunk_id[4];   // "data"
+    uint32_t    data_chunk_size;    // Total audio data bytes
+} WAV_HeaderTypeDef;
+#pragma pack(pop)
 /* USER CODE END Prototypes */
 #ifdef __cplusplus
 }

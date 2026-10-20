@@ -15,6 +15,11 @@
   *
   ******************************************************************************
   */
+
+#include "stdio.h"
+#include "stdlib.h"
+#include "ctype.h"
+#include "string.h"
 /* USER CODE END Header */
 #include "fatfs.h"
 
@@ -24,6 +29,8 @@ FATFS SDFatFS;    /* File system object for SD logical drive */
 FIL SDFile;       /* File object for SD */
 
 /* USER CODE BEGIN Variables */
+
+
 
 /* USER CODE END Variables */
 
@@ -50,5 +57,49 @@ DWORD get_fattime(void)
 }
 
 /* USER CODE BEGIN Application */
+void GetNextFileName(char *filename)
+{
+  static DIR rootdir __attribute((aligned(4)));
+  static FILINFO info __attribute((aligned(4)));
+  FRESULT res;
+  uint8_t max_num = 0;
 
+  res = f_opendir(&rootdir, "/");
+    if (res == FR_OK) 
+    {
+        while (1) 
+        {
+            // 2. Read the next item in the directory
+            res = f_readdir(&rootdir, &info);
+            
+            // Break if error or end of directory list reached
+            if (res != FR_OK || info.fname[0] == 0) break; 
+            
+            // Skip sub-directories, look only at physical files
+            if (!(info.fattrib & AM_DIR)) 
+            {
+                // 3. Check if the file matches our prefix "REC_" and extension ".WAV"
+                // Case-insensitive comparisons are safer
+                if (strncasecmp(info.fname, "REC_", 4) == 0) 
+                {
+                    char *ext = strrchr(info.fname, '.');
+                    if (ext && strcasecmp(ext, ".WAV") == 0) 
+                    {
+                        // 4. Extract the number from between "REC_" and ".WAV"
+                        // Assuming your format is "REC_001.WAV", the digits start at index 4
+                        int current_num = atoi(&info.fname[4]);
+                        
+                        // Track the absolute highest index found on the card
+                        if (current_num > max_num) 
+                        {
+                            max_num = current_num;
+                        }
+                    }
+                }
+            }
+        }
+        f_closedir(&rootdir); // Always close directories to release internal FatFs handles
+    }
+    sprintf(filename, "REC_%03d.WAV", (max_num+1));
+}
 /* USER CODE END Application */
