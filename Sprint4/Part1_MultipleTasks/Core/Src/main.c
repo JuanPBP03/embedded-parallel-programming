@@ -26,11 +26,16 @@
 #include "FreeRTOS.h"
 #include "cmsis_os2.h"
 #include "ff.h"
+#include "ff_gen_drv.h"
 #include "portmacro.h"
 #include "projdefs.h"
+#include "stm32l476xx.h"
 #include "stm32l4xx_hal_def.h"
 #include "stm32l4xx_hal_gpio.h"
+#include "stm32l4xx_hal_rtc.h"
 #include "stm32l4xx_hal_sai.h"
+#include "stm32l4xx_hal_sd.h"
+#include "stm32l4xx_hal_tim.h"
 #include "stm32l4xx_nucleo.h"
 #include "task.h"
 #include "arm_math.h"
@@ -39,6 +44,7 @@
 #include "queue.h"
 #include "stdarg.h"
 #include "event_groups.h"
+#include "string.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -62,10 +68,12 @@
 
 #define FFT_QUEUE_LEN                      4
 
-#define SD_CONNECTION_BIT                 (1 << 0)
-#define SD_RECORDING_CTL_BIT              (1 << 1) 
-#define SD_RECORDING_STATUS_BIT           (1 << 2)
-#define SD_RECORDING_ACTIVE               (1 << 2)
+#define SD_CONNECTED_BIT                    (1<<0)
+#define SD_DISCONNECTED_BIT                 (1<<1)
+#define SD_EJECT_BIT                        (1<<2)
+#define SD_RECORDING_CTL_BIT                (1<<3) 
+#define SD_RECORDING_STATUS_BIT             (1<<4)
+#define SD_RECORDING_ACTIVE                 (1<<5)
 #define SD_RECORDING_STOPPED               0
 /* USER CODE END PD */
 
@@ -77,11 +85,15 @@
 
 /* Private variables ---------------------------------------------------------*/
 
+RTC_HandleTypeDef hrtc;
+
 SAI_HandleTypeDef hsai_BlockA2;
 DMA_HandleTypeDef hdma_sai2_a;
 
 SD_HandleTypeDef hsd1;
 DMA_HandleTypeDef hdma_sdmmc1;
+
+TIM_HandleTypeDef htim2;
 
 UART_HandleTypeDef huart2;
 
@@ -98,7 +110,10 @@ extern uint8_t retSD;    /* Return value for SD */
 extern char SDPath[4];   /* SD logical drive path */
 extern FATFS SDFatFS;    /* File system object for SD logical drive */
 extern FIL SDFile;       /* File object for SD */
-char writeBuff[128] __attribute__((aligned(4)));
+
+
+char UARTrxBuf[6];
+uint8_t buttonLongPressed;
 static WAV_HeaderTypeDef wavHeader={
   .riff_chunk_id="RIFF",
   .format="WAVE",
@@ -155,6 +170,8 @@ static void MX_DMA_Init(void);
 static void MX_SAI2_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_SDMMC1_SD_Init(void);
+static void MX_RTC_Init(void);
+static void MX_TIM2_Init(void);
 void StartDefaultTask(void *argument);
 
 /* USER CODE BEGIN PFP */
@@ -177,7 +194,8 @@ void UART_Printf(const char* fmt, ...) {
 
 void SD_init() {
 
-    UART_Printf("Initializing SD Card");
+    UART_Printf("Initializing SD Card\r\n");
+    MX_FATFS_Init();
     retSD = f_mount(&SDFatFS, (TCHAR const*)SDPath, 0);
     if(retSD != FR_OK) {
         UART_Printf("f_mount() failed, retSD = %d\r\n", retSD);
@@ -240,6 +258,14 @@ void SD_init() {
     UART_Printf("SD Initialization Done!\r\n");
     BSP_LED_On(LED_GREEN);
 }
+
+void SD_DeInit(void){
+  f_sync(&SDFile);
+  FATFS_UnLinkDriver(SDPath);
+  HAL_SD_DeInit(&hsd1);
+  f_mount(&SDFatFS, SDPath, 0);
+  UART_Printf("SD Card Deinitalized\r\n");
+}
 /* USER CODE END 0 */
 
 /**
@@ -276,8 +302,16 @@ int main(void)
   MX_USART2_UART_Init();
   MX_SDMMC1_SD_Init();
   MX_FATFS_Init();
+  MX_RTC_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
   arm_rfft_fast_init_f32(&xFFT_instance, FFT_LENGTH);
+
+  UART_Printf("Provide date as DDMMYY:\r\n");
+  HAL_UART_Receive(&huart2, (uint8_t*)UARTrxBuf, 6, HAL_MAX_DELAY);
+  RTC_DateTypeDef datetime;
+  sscanf(UARTrxBuf, "%2hhd%hhd%hhd", &datetime.Date, &datetime.Month, &datetime.Year);
+  HAL_RTC_SetDate(&hrtc,&datetime,RTC_FORMAT_BIN);
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -309,9 +343,9 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
-  UBaseType_t ret = xTaskCreate(vAudioProcessingTask, "Audio Processing", 128, NULL, 2, &AudioProcessingTaskHandle);
-  ret = xTaskCreate(vSDCardCTLTask, "SD Card Write", 512, NULL, 1, &SDCardCTLTaskHandle);
-  ret = xTaskCreate(vSDRecordingTask, "SD Recording", 512, NULL, 2, &SDRecordingTaskHandle);
+  xTaskCreate(vAudioProcessingTask, "Audio Processing", 128, NULL, 2, &AudioProcessingTaskHandle);
+  xTaskCreate(vSDCardCTLTask, "SD Control", 512, NULL, 1, &SDCardCTLTaskHandle);
+  xTaskCreate(vSDRecordingTask, "SD Recording", 512, NULL, 2, &SDRecordingTaskHandle);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -355,9 +389,10 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_LSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
   RCC_OscInitStruct.PLL.PLLM = 1;
@@ -383,6 +418,70 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief RTC Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_RTC_Init(void)
+{
+
+  /* USER CODE BEGIN RTC_Init 0 */
+
+  /* USER CODE END RTC_Init 0 */
+
+  RTC_TimeTypeDef sTime = {0};
+  RTC_DateTypeDef sDate = {0};
+
+  /* USER CODE BEGIN RTC_Init 1 */
+
+  /* USER CODE END RTC_Init 1 */
+
+  /** Initialize RTC Only
+  */
+  hrtc.Instance = RTC;
+  hrtc.Init.HourFormat = RTC_HOURFORMAT_24;
+  hrtc.Init.AsynchPrediv = 127;
+  hrtc.Init.SynchPrediv = 255;
+  hrtc.Init.OutPut = RTC_OUTPUT_DISABLE;
+  hrtc.Init.OutPutRemap = RTC_OUTPUT_REMAP_NONE;
+  hrtc.Init.OutPutPolarity = RTC_OUTPUT_POLARITY_HIGH;
+  hrtc.Init.OutPutType = RTC_OUTPUT_TYPE_OPENDRAIN;
+  if (HAL_RTC_Init(&hrtc) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* USER CODE BEGIN Check_RTC_BKUP */
+
+  /* USER CODE END Check_RTC_BKUP */
+
+  /** Initialize RTC and set the Time and Date
+  */
+  sTime.Hours = 0x0;
+  sTime.Minutes = 0x0;
+  sTime.Seconds = 0x0;
+  sTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+  sTime.StoreOperation = RTC_STOREOPERATION_RESET;
+  if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BCD) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sDate.WeekDay = RTC_WEEKDAY_MONDAY;
+  sDate.Month = RTC_MONTH_JANUARY;
+  sDate.Date = 0x1;
+  sDate.Year = 0x0;
+
+  if (HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BCD) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN RTC_Init 2 */
+
+  /* USER CODE END RTC_Init 2 */
+
 }
 
 /**
@@ -445,6 +544,55 @@ static void MX_SDMMC1_SD_Init(void)
   /* USER CODE BEGIN SDMMC1_Init 2 */
 
   /* USER CODE END SDMMC1_Init 2 */
+
+}
+
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 6400;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 19999;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_OnePulse_Init(&htim2, TIM_OPMODE_SINGLE) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
 
 }
 
@@ -527,7 +675,7 @@ static void MX_GPIO_Init(void)
 
   /*Configure GPIO pin : PC13 */
   GPIO_InitStruct.Pin = GPIO_PIN_13;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
@@ -540,7 +688,7 @@ static void MX_GPIO_Init(void)
 
   /*Configure GPIO pin : SD_DETECT_Pin */
   GPIO_InitStruct.Pin = SD_DETECT_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(SD_DETECT_GPIO_Port, &GPIO_InitStruct);
 
@@ -600,19 +748,29 @@ void vSDCardCTLTask(void *argument){
   }
   for(;;)
   {
-    bits = xEventGroupWaitBits(xhFilesystemEventGroup, SD_CONNECTION_BIT | SD_RECORDING_CTL_BIT, pdTRUE, pdFALSE, portMAX_DELAY);
+    bits = xEventGroupWaitBits(xhFilesystemEventGroup, SD_CONNECTED_BIT | SD_RECORDING_CTL_BIT, pdTRUE, pdFALSE, portMAX_DELAY);
     if(bits & SD_RECORDING_CTL_BIT)
     {
-      // Query the live state of the group instead of the cleared 'bits' snapshot
-      EventBits_t live_bits = xEventGroupGetBits(xhFilesystemEventGroup);
-      
-      if(!(live_bits & SD_RECORDING_ACTIVE)){
+
+      if(!(bits & SD_RECORDING_ACTIVE)){
         xEventGroupSetBits(xhFilesystemEventGroup, SD_RECORDING_ACTIVE);
         UART_Printf("Recording Started...\r\n");
       }else{
         xEventGroupClearBits(xhFilesystemEventGroup, SD_RECORDING_ACTIVE);
         UART_Printf("Stopping Recording...\r\n");
       }
+    }
+    if(bits & SD_EJECT_BIT)
+    {
+      SD_DeInit();
+      init = 0;
+      UART_Printf("SD Card Ejected\r\n");
+    }
+    if(bits & SD_CONNECTED_BIT)
+    {
+      UART_Printf("SD Card Detected");
+      SD_init();
+      init = 1;
     }
   }
 }
@@ -629,7 +787,7 @@ void vSDRecordingTask(void *argument)
 
   for(;;)
   {
-    EventBits_t res = xEventGroupWaitBits(xhFilesystemEventGroup, SD_RECORDING_ACTIVE, pdFALSE, pdTRUE, portMAX_DELAY);
+    xEventGroupWaitBits(xhFilesystemEventGroup, SD_RECORDING_ACTIVE, pdFALSE, pdTRUE, portMAX_DELAY);
 
     GetNextFileName(filename);
 
@@ -641,6 +799,8 @@ void vSDRecordingTask(void *argument)
     }
     UART_Printf("Creating recording %s\r\n", filename);
     uint32_t packed_idx;
+    // reserve the 44-byte header; it gets rewritten with real sizes at the end
+    f_write(&wavFile, &wavHeader, sizeof(WAV_HeaderTypeDef), &bytesWritten);
     wavHeader.chunk_size = 0; 
     wavHeader.data_chunk_size = 0;
     total_audio_bytes = 0;
@@ -665,7 +825,6 @@ void vSDRecordingTask(void *argument)
         UART_Printf("Queue Timed Out\r\n");
         continue; 
       }
-      UART_Printf("Writing Queue Data\r\n");
       // 5. Pack data normally (only reaches here if data was actually received)
       packed_idx = 0; 
       for (uint32_t i = 0; i < AUDIO_BLOCK_LEN_WORDS; i++) 
@@ -738,6 +897,10 @@ void traceTaskSwitch(void)
   HAL_UART_Transmit(&huart2, buf1, strlen((char*)buf1), HAL_MAX_DELAY);
 }
 
+uint8_t BSP_SD_IsDetected(void)
+{
+  return HAL_GPIO_ReadPin(SD_DETECT_GPIO_Port, SD_DETECT_Pin) ? 0 : 1;
+}
 uint8_t BSP_SD_ReadBlocks_DMA(uint32_t *pData, uint32_t ReadAddr, uint32_t NumOfBlocks)
 {
  uint8_t sd_state = MSD_OK;
@@ -785,16 +948,32 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 
   if(SD_DETECT_Pin == GPIO_Pin)
   {
-    xEventGroupSetBitsFromISR(xhFilesystemEventGroup, SD_CONNECTION_BIT, &xHigherPriorityTaskWoken );
+    if(BSP_SD_IsDetected())
+    {
+    xEventGroupSetBitsFromISR(xhFilesystemEventGroup, SD_CONNECTED_BIT, &xHigherPriorityTaskWoken );
+    }else {
+    xEventGroupSetBitsFromISR(xhFilesystemEventGroup, SD_DISCONNECTED_BIT, &xHigherPriorityTaskWoken);
+    }
   }
 
   if(GPIO_PIN_13 == GPIO_Pin)
   {
-    xEventGroupSetBitsFromISR(xhFilesystemEventGroup, SD_RECORDING_CTL_BIT, &xHigherPriorityTaskWoken );
+    
+    if(!BSP_PB_GetState(BUTTON_USER)){
+      buttonLongPressed = 0;
+      
+      __HAL_TIM_SET_COUNTER(&htim2, 0);
+      HAL_TIM_Base_Start_IT(&htim2);
+    }else {
+      HAL_TIM_Base_Stop_IT(&htim2);
+      if(!buttonLongPressed && (__HAL_TIM_GET_COUNTER(&htim2) > 500))
+      {
+        xEventGroupSetBitsFromISR(xhFilesystemEventGroup, SD_RECORDING_CTL_BIT, &xHigherPriorityTaskWoken);
+      }
+    }
   }
   portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
-
 
 /* USER CODE END 4 */
 
@@ -828,6 +1007,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   /* USER CODE BEGIN Callback 0 */
 
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+  if(htim->Instance == TIM2){
+    buttonLongPressed = 1;
+    xEventGroupSetBitsFromISR(xhFilesystemEventGroup, SD_EJECT_BIT, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+  }
   /* USER CODE END Callback 0 */
   if (htim->Instance == TIM6)
   {
