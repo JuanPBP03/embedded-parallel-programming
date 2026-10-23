@@ -94,7 +94,13 @@ FillZerobss:
 LoopFillZerobss:
   cmp r2, r4
   bcc FillZerobss
-
+  ldr	r0, =_sram2
+  ldr	r1, =_eram2
+  movs	r2, #0
+FillZeroRam2:
+	str	r2, [r0], #4
+	cmp	r0, r1
+	bcc	FillZeroRam2
 /* Call static constructors */
     bl __libc_init_array
 /* Call the application's entry point.*/

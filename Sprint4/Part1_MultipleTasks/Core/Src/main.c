@@ -55,16 +55,16 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define DMA_BUF_SIZE                       512
+#define DMA_BUF_SIZE                       1024
 #define AUDIO_BLOCK_LEN_WORDS             (DMA_BUF_SIZE/2)
 #define AUDIO_BLOCK_SIZE_BYTES            (AUDIO_BLOCK_LEN_WORDS*4)
 #define FFT_LENGTH                         AUDIO_BLOCK_LEN_WORDS
 #define FFT_MAG_LEN                       (FFT_LENGTH/2)
 #define FFT_MAG_LEN_BYTES                 (FFT_MAG_LEN*4)
 #define SAMPLE_RATE                        44117.0f
-#define FFT_RESOLUTION                    (SAMPLE_RATE/FFT_LENGTH) // 44100/512 = 86.1328125 Hz
+#define FFT_RESOLUTION                    (int)(SAMPLE_RATE/FFT_LENGTH) // 44100/256 = 172.265625 Hz
 
-#define AUDIO_QUEUE_LEN                    8
+#define AUDIO_QUEUE_LEN                    4
 #define AUDIO_QUEUE_SIZE                  (AUDIO_QUEUE_LEN*AUDIO_BLOCK_SIZE_BYTES)
 
 #define FFT_QUEUE_LEN                      4
@@ -111,6 +111,7 @@ extern char SDPath[4];   /* SD logical drive path */
 extern FATFS SDFatFS;    /* File system object for SD logical drive */
 extern FIL SDFile;       /* File object for SD */
 
+uint8_t init = 0;
 
 char UARTrxBuf[6];
 uint8_t buttonLongPressed;
@@ -131,10 +132,10 @@ static WAV_HeaderTypeDef wavHeader={
 };
 
 
-static int32_t raw_audio_samples[AUDIO_BLOCK_LEN_WORDS] __attribute__((aligned(4)));
-static int32_t raw_audio_samples2[AUDIO_BLOCK_LEN_WORDS] __attribute__((aligned(4)));
-static uint8_t packed_24bit_buf[ AUDIO_BLOCK_SIZE_BYTES * 3 ] __attribute__((aligned(4)));
-int32_t DMA_buf[DMA_BUF_SIZE];
+int32_t raw_audio_samples[AUDIO_BLOCK_LEN_WORDS] __attribute__((aligned(4))) __attribute__((section(".ram2")));
+int32_t raw_audio_samples2[AUDIO_BLOCK_LEN_WORDS] __attribute__((aligned(4))) __attribute__((section(".ram2")));
+uint8_t packed_24bit_buf[ AUDIO_BLOCK_LEN_WORDS * 3 ] __attribute__((aligned(4))) __attribute__((section(".ram2")));
+int32_t DMA_buf[DMA_BUF_SIZE] __attribute__((aligned(4))) __attribute__((section(".ram2")));
 
 arm_rfft_fast_instance_f32 xFFT_instance;
 
@@ -143,20 +144,21 @@ float32_t fft_output[FFT_LENGTH];
 float32_t fft_magnitude[FFT_MAG_LEN];
 
 TaskHandle_t AudioProcessingTaskHandle;
+TaskHandle_t FFTProcessingTaskHandle;
 TaskHandle_t SDCardCTLTaskHandle;
 TaskHandle_t SDRecordingTaskHandle;
 
 static StaticQueue_t xAudioQueue;
 QueueHandle_t xhAudioQueue;
-uint8_t AudioQueueStorageBuffer[AUDIO_QUEUE_SIZE];
+uint8_t AudioQueueStorageBuffer[AUDIO_QUEUE_SIZE] __attribute__((section(".ram2")));
 
 static StaticQueue_t xFFTQueue;
 QueueHandle_t xhFFTQueue;
-uint8_t FFTQueueStorageBuffer[FFT_QUEUE_LEN*FFT_MAG_LEN_BYTES];
+uint8_t FFTQueueStorageBuffer[FFT_QUEUE_LEN*FFT_MAG_LEN_BYTES] __attribute__((section(".ram2")));
 
 static StaticQueue_t xRecordingQueue;
 QueueHandle_t xhRecordingQueue;
-uint8_t RecordingQueueStorageBuffer[AUDIO_QUEUE_SIZE];
+uint8_t RecordingQueueStorageBuffer[AUDIO_QUEUE_SIZE] __attribute__((section(".ram2")));
 
 EventGroupHandle_t xhFilesystemEventGroup;
 
@@ -176,6 +178,7 @@ void StartDefaultTask(void *argument);
 
 /* USER CODE BEGIN PFP */
 void vAudioProcessingTask(void *argument);
+void vFFTProcessingTask(void *argument);
 void vSDCardCTLTask(void *argument);
 void vSDRecordingTask(void *argument);
 void traceTaskSwitch(void);
@@ -194,8 +197,8 @@ void UART_Printf(const char* fmt, ...) {
 
 void SD_Init() {
 
-    UART_Printf("Initializing SD Card\r\n");
     MX_FATFS_Init();
+    UART_Printf("Initializing SD Card\r\n");
     retSD = f_mount(&SDFatFS, (TCHAR const*)SDPath, 0);
     if(retSD != FR_OK) {
         UART_Printf("f_mount() failed, retSD = %d\r\n", retSD);
@@ -254,7 +257,7 @@ void SD_Init() {
         return;
     }
 
-    
+    init = 1;
     UART_Printf("SD Initialization Done!\r\n");
     BSP_LED_On(LED_GREEN);
 }
@@ -263,6 +266,7 @@ void SD_DeInit(void){
   FATFS_UnLinkDriver(SDPath);
   HAL_SD_DeInit(&hsd1);
   f_mount(&SDFatFS, SDPath, 0);
+  init = 0;
   UART_Printf("SD Card Deinitalized\r\n");
 }
 /* USER CODE END 0 */
@@ -311,10 +315,14 @@ int main(void)
   RTC_DateTypeDef datetime={
     1,
     0,
-    0,
+    0, 
     0
   };
-  sscanf(UARTrxBuf, "%2hhd%2hhd%2hhd", &datetime.Date, &datetime.Month, &datetime.Year);
+  int day,month,year;
+  sscanf(UARTrxBuf, "%2d%2d%2d", &day, &month, &year);
+  datetime.Date = day;
+  datetime.Month = month;
+  datetime.Year = year;
   HAL_RTC_SetDate(&hrtc,&datetime,RTC_FORMAT_BIN);
   /* USER CODE END 2 */
 
@@ -347,9 +355,10 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
-  xTaskCreate(vAudioProcessingTask, "Audio Processing", 128, NULL, 2, &AudioProcessingTaskHandle);
-  xTaskCreate(vSDCardCTLTask, "SD Control", 512, NULL, 1, &SDCardCTLTaskHandle);
+  xTaskCreate(vAudioProcessingTask, "Audio Processing", 512, NULL, 2, &AudioProcessingTaskHandle);
+  xTaskCreate(vSDCardCTLTask, "SD Control", 256, NULL, 1, &SDCardCTLTaskHandle);
   xTaskCreate(vSDRecordingTask, "SD Recording", 512, NULL, 2, &SDRecordingTaskHandle);
+  xTaskCreate(vFFTProcessingTask, "FFT Processing", 312, NULL, 2, &FFTProcessingTaskHandle);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -715,45 +724,53 @@ void vAudioProcessingTask(void *argument){
   HAL_SAI_Receive_DMA(&hsai_BlockA2, (uint8_t*)DMA_buf, DMA_BUF_SIZE);
   for(;;)
   {
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    // xQueueReceive(xhAudioQueue, raw_audio_samples, portMAX_DELAY);
+    xQueueReceive(xhAudioQueue, raw_audio_samples, portMAX_DELAY);
     
 
-    // if(raw_audio_samples[0]!=0)
-    // {
-    //   for(uint32_t i=0;i<FFT_LENGTH;i++)
-    //   {
+    if(raw_audio_samples[0]!=0)
+    {
+      for(uint32_t i=0;i<FFT_LENGTH;i++)
+      {
 
-    //     int32_t signed_sample = ((int32_t)raw_audio_samples[i] << 8) >> 8; // EXTEND SIGN BIT FROM 24 BIT WORDS
+        int32_t signed_sample = ((int32_t)raw_audio_samples[i] << 8) >> 8; // EXTEND SIGN BIT FROM 24 BIT WORDS
 
-    //     fft_input[i] = signed_sample / 8388608.0f; // NORMALIZE TO FLOAT DIVIDING BY 2**23
+        fft_input[i] = signed_sample / 8388608.0f; // NORMALIZE TO FLOAT DIVIDING BY 2**23
     
-    //   }
-    //   arm_rfft_fast_f32(&xFFT_instance, fft_input, fft_output, 0);
-    //   arm_cmplx_mag_f32(&fft_output[2], &fft_magnitude[1], FFT_MAG_LEN-1);
+      }
+      arm_rfft_fast_f32(&xFFT_instance, fft_input, fft_output, 0);
+      arm_cmplx_mag_f32(&fft_output[2], &fft_magnitude[1], FFT_MAG_LEN-1);
 
-    //   fft_magnitude[0] = fabsf(fft_output[0]); // fft_output[0] is already real
+      fft_magnitude[0] = fabsf(fft_output[0]); // fft_output[0] is already real
 
       
-    // }
-    // xQueueSend(xhRecordingQueue, raw_audio_samples, pdMS_TO_TICKS(20));
-    // xQueueSend(xhFFTQueue, fft_magnitude, 0);
+    }
+    xQueueSend(xhRecordingQueue, raw_audio_samples, pdMS_TO_TICKS(20));
+    xTaskNotifyGive(FFTProcessingTaskHandle);
   }
 }
 
-void vSDCardCTLTask(void *argument){
+void vFFTProcessingTask(void *argument){ // Control task responding to audio frequencies
+  for(;;)
+  {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    // Process the FFT magnitude data here
+    if(fft_magnitude[1000/FFT_RESOLUTION] > 0.4f) {
+      UART_Printf("1kHz tone detected: %f\r\n", fft_magnitude[1000/FFT_RESOLUTION]);
+    }
+  }
+}
+
+void vSDCardCTLTask(void *argument){  // Control Task for SD Card events (connect, eject, recording control)
   EventBits_t bits;
-  uint8_t init = 0;
   
   if(BSP_SD_IsDetected() && (init == 0))
   {
     SD_Init();
-    init = 1;
   }
   for(;;)
   {
     bits = xEventGroupWaitBits(xhFilesystemEventGroup, SD_CONNECTION_EVENT_BIT | SD_EJECT_BIT | SD_RECORDING_CTL_BIT, pdTRUE, pdFALSE, portMAX_DELAY);
-    if(bits & SD_RECORDING_CTL_BIT)
+    if(bits & SD_RECORDING_CTL_BIT && BSP_SD_IsDetected() && (init == 1))
     {
 
       if(!(bits & SD_RECORDING_ACTIVE)){
@@ -767,24 +784,18 @@ void vSDCardCTLTask(void *argument){
     if(bits & SD_EJECT_BIT)
     {
       SD_DeInit();
-      init = 0;
       UART_Printf("SD Card Ejected\r\n");
     }
     if(bits & SD_CONNECTION_EVENT_BIT)
     {
       vTaskDelay(pdMS_TO_TICKS(500));
-      if(BSP_SD_IsDetected())
-      {
-        if(init == 0)
-        {
+      if(BSP_SD_IsDetected() && (init == 0))
+      {  
         UART_Printf("SD Card Connected\r\n");
         SD_Init();
-        init = 1;
-        }
-      }else {
+      }else if (!BSP_SD_IsDetected()){
         UART_Printf("SD Card Disconnected\r\n");
         SD_DeInit();
-        init = 0;
       }
 
     }
@@ -893,14 +904,14 @@ void vSDRecordingTask(void *argument)
 void HAL_SAI_RxHalfCpltCallback(SAI_HandleTypeDef *hsai){
   BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
-  xQueueSendFromISR(xhRecordingQueue, &DMA_buf[0], &xHigherPriorityTaskWoken);
+  xQueueSendFromISR(xhAudioQueue, &DMA_buf[0], &xHigherPriorityTaskWoken);
   portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
 void HAL_SAI_RxCpltCallback(SAI_HandleTypeDef *hsai){
   BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
-  xQueueSendFromISR(xhRecordingQueue, (DMA_buf+AUDIO_BLOCK_LEN_WORDS), &xHigherPriorityTaskWoken);
+  xQueueSendFromISR(xhAudioQueue, (DMA_buf+AUDIO_BLOCK_LEN_WORDS), &xHigherPriorityTaskWoken);
   portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
@@ -961,7 +972,7 @@ uint8_t BSP_SD_WriteBlocks_DMA(uint32_t *pData, uint32_t WriteAddr, uint32_t Num
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
   BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-
+  static uint8_t buttonpresses = 0;
   if(SD_DETECT_Pin == GPIO_Pin)
   {
     xEventGroupSetBitsFromISR(xhFilesystemEventGroup, SD_CONNECTION_EVENT_BIT, &xHigherPriorityTaskWoken );
@@ -970,7 +981,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 
   if(GPIO_PIN_13 == GPIO_Pin)
   {
-    
+    buttonpresses++;
     if(!BSP_PB_GetState(BUTTON_USER)){
       buttonLongPressed = 0;
       
@@ -1046,6 +1057,7 @@ void Error_Handler(void)
   __disable_irq();
   while (1)
   {
+    UART_Printf("Error_Handler() called! Halting execution.\r\n");
   }
   /* USER CODE END Error_Handler_Debug */
 }

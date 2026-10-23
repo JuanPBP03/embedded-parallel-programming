@@ -223,6 +223,14 @@ SECTIONS
       PROVIDE( __bss_end = .);
   } >RAM
   PROVIDE( __non_tls_bss_start = ADDR(.bss) );
+  
+  .ram2 :
+  {
+    _sram2 = .;
+    *(.ram2*)
+    . = ALIGN(4);
+    _eram2 = .;
+  } > RAM2
 
   PROVIDE( __bss_start = __tbss_start );
   PROVIDE( __bss_size = __bss_end - __bss_start );

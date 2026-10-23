@@ -55,9 +55,8 @@ DWORD get_fattime(void)
   /* USER CODE BEGIN get_fattime */
   RTC_DateTypeDef date;
   HAL_RTC_GetDate(&hrtc, &date, RTC_FORMAT_BIN);
-  DWORD fattime = (date.Year + 20) | date.Month << 21 | date.Date << 16;
+  DWORD fattime = (date.Year + 20)<<25 | date.Month << 21 | date.Date << 16;
   return fattime;
-  return 0;
   /* USER CODE END get_fattime */
 }
 
