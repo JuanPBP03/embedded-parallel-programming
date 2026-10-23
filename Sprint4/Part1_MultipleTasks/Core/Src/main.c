@@ -25,18 +25,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "FreeRTOS.h"
-#include "cmsis_os2.h"
-#include "ff.h"
-#include "ff_gen_drv.h"
-#include "portmacro.h"
-#include "projdefs.h"
 #include "stm32l476xx.h"
-#include "stm32l4xx_hal_def.h"
-#include "stm32l4xx_hal_gpio.h"
-#include "stm32l4xx_hal_rtc.h"
-#include "stm32l4xx_hal_sai.h"
-#include "stm32l4xx_hal_sd.h"
-#include "stm32l4xx_hal_tim.h"
 #include "stm32l4xx_nucleo.h"
 #include "task.h"
 #include "arm_math.h"
@@ -45,7 +34,7 @@
 #include "queue.h"
 #include "stdarg.h"
 #include "event_groups.h"
-#include "string.h"
+#include "semphr.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -155,6 +144,7 @@ uint8_t AudioQueueStorageBuffer[AUDIO_QUEUE_SIZE] __attribute__((section(".ram2"
 static StaticQueue_t xFFTQueue;
 QueueHandle_t xhFFTQueue;
 uint8_t FFTQueueStorageBuffer[FFT_QUEUE_LEN*FFT_MAG_LEN_BYTES] __attribute__((section(".ram2")));
+SemaphoreHandle_t xFFTProcessingSemaphore;
 
 static StaticQueue_t xRecordingQueue;
 QueueHandle_t xhRecordingQueue;
@@ -335,6 +325,7 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
   /* add semaphores, ... */
+  xFFTProcessingSemaphore = xSemaphoreCreateBinary();
   /* USER CODE END RTOS_SEMAPHORES */
 
   /* USER CODE BEGIN RTOS_TIMERS */
@@ -745,14 +736,14 @@ void vAudioProcessingTask(void *argument){
       
     }
     xQueueSend(xhRecordingQueue, raw_audio_samples, pdMS_TO_TICKS(20));
-    xTaskNotifyGive(FFTProcessingTaskHandle);
+    xSemaphoreGive(xFFTProcessingSemaphore);
   }
 }
 
 void vFFTProcessingTask(void *argument){ // Control task responding to audio frequencies
   for(;;)
   {
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    xSemaphoreTake(xFFTProcessingSemaphore, portMAX_DELAY);
     // Process the FFT magnitude data here
     if(fft_magnitude[1000/FFT_RESOLUTION] > 0.4f) {
       UART_Printf("1kHz tone detected: %f\r\n", fft_magnitude[1000/FFT_RESOLUTION]);
