@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "bsp_driver_sd.h"
 #include "cmsis_os.h"
 #include "fatfs.h"
 
@@ -68,12 +69,11 @@
 
 #define FFT_QUEUE_LEN                      4
 
-#define SD_CONNECTED_BIT                    (1<<0)
-#define SD_DISCONNECTED_BIT                 (1<<1)
-#define SD_EJECT_BIT                        (1<<2)
-#define SD_RECORDING_CTL_BIT                (1<<3) 
-#define SD_RECORDING_STATUS_BIT             (1<<4)
-#define SD_RECORDING_ACTIVE                 (1<<5)
+#define SD_CONNECTION_EVENT_BIT             (1<<0)
+#define SD_EJECT_BIT                        (1<<1)
+#define SD_RECORDING_CTL_BIT                (1<<2) 
+#define SD_RECORDING_STATUS_BIT             (1<<3)
+#define SD_RECORDING_ACTIVE                 (1<<4)
 #define SD_RECORDING_STOPPED               0
 /* USER CODE END PD */
 
@@ -192,7 +192,7 @@ void UART_Printf(const char* fmt, ...) {
     va_end(args);
 }
 
-void SD_init() {
+void SD_Init() {
 
     UART_Printf("Initializing SD Card\r\n");
     MX_FATFS_Init();
@@ -260,7 +260,6 @@ void SD_init() {
 }
 
 void SD_DeInit(void){
-  f_sync(&SDFile);
   FATFS_UnLinkDriver(SDPath);
   HAL_SD_DeInit(&hsd1);
   f_mount(&SDFatFS, SDPath, 0);
@@ -309,8 +308,13 @@ int main(void)
 
   UART_Printf("Provide date as DDMMYY:\r\n");
   HAL_UART_Receive(&huart2, (uint8_t*)UARTrxBuf, 6, HAL_MAX_DELAY);
-  RTC_DateTypeDef datetime;
-  sscanf(UARTrxBuf, "%2hhd%hhd%hhd", &datetime.Date, &datetime.Month, &datetime.Year);
+  RTC_DateTypeDef datetime={
+    1,
+    0,
+    0,
+    0
+  };
+  sscanf(UARTrxBuf, "%2hhd%2hhd%2hhd", &datetime.Date, &datetime.Month, &datetime.Year);
   HAL_RTC_SetDate(&hrtc,&datetime,RTC_FORMAT_BIN);
   /* USER CODE END 2 */
 
@@ -743,12 +747,12 @@ void vSDCardCTLTask(void *argument){
   
   if(BSP_SD_IsDetected() && (init == 0))
   {
-    SD_init();
+    SD_Init();
     init = 1;
   }
   for(;;)
   {
-    bits = xEventGroupWaitBits(xhFilesystemEventGroup, SD_CONNECTED_BIT | SD_RECORDING_CTL_BIT, pdTRUE, pdFALSE, portMAX_DELAY);
+    bits = xEventGroupWaitBits(xhFilesystemEventGroup, SD_CONNECTION_EVENT_BIT | SD_EJECT_BIT | SD_RECORDING_CTL_BIT, pdTRUE, pdFALSE, portMAX_DELAY);
     if(bits & SD_RECORDING_CTL_BIT)
     {
 
@@ -766,11 +770,23 @@ void vSDCardCTLTask(void *argument){
       init = 0;
       UART_Printf("SD Card Ejected\r\n");
     }
-    if(bits & SD_CONNECTED_BIT)
+    if(bits & SD_CONNECTION_EVENT_BIT)
     {
-      UART_Printf("SD Card Detected");
-      SD_init();
-      init = 1;
+      vTaskDelay(pdMS_TO_TICKS(500));
+      if(BSP_SD_IsDetected())
+      {
+        if(init == 0)
+        {
+        UART_Printf("SD Card Connected\r\n");
+        SD_Init();
+        init = 1;
+        }
+      }else {
+        UART_Printf("SD Card Disconnected\r\n");
+        SD_DeInit();
+        init = 0;
+      }
+
     }
   }
 }
@@ -948,12 +964,8 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 
   if(SD_DETECT_Pin == GPIO_Pin)
   {
-    if(BSP_SD_IsDetected())
-    {
-    xEventGroupSetBitsFromISR(xhFilesystemEventGroup, SD_CONNECTED_BIT, &xHigherPriorityTaskWoken );
-    }else {
-    xEventGroupSetBitsFromISR(xhFilesystemEventGroup, SD_DISCONNECTED_BIT, &xHigherPriorityTaskWoken);
-    }
+    xEventGroupSetBitsFromISR(xhFilesystemEventGroup, SD_CONNECTION_EVENT_BIT, &xHigherPriorityTaskWoken );
+
   }
 
   if(GPIO_PIN_13 == GPIO_Pin)
