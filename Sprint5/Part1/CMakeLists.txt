@@ -41,17 +41,36 @@ add_subdirectory(cmake/stm32cubemx)
 target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined library search paths
 )
+set(TRACERECORDER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/TraceRecorder)
+
+file(GLOB TRACERECORDER_SOURCES
+    "${TRACERECORDER_DIR}/*.c"
+    "${TRACERECORDER_DIR}/streamports/RingBuffer/*.c" # Choose your streamport
+)
 
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
+    ${TRACERECORDER_SOURCES}
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
-)
+    ${CMAKE_CURRENT_SOURCE_DIR}/TraceRecorder/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/TraceRecorder/config
+    ${CMAKE_CURRENT_SOURCE_DIR}/TraceRecorder/streamports/RingBuffer/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/TraceRecorder/streamports/RingBuffer/config
 
+)
+target_include_directories(stm32cubemx INTERFACE
+    # Add user defined include paths
+    ${CMAKE_CURRENT_SOURCE_DIR}/TraceRecorder/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/TraceRecorder/config
+    ${CMAKE_CURRENT_SOURCE_DIR}/TraceRecorder/streamports/RingBuffer/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/TraceRecorder/streamports/RingBuffer/config
+
+)
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined symbols
@@ -63,6 +82,5 @@ list(REMOVE_ITEM CMAKE_C_IMPLICIT_LINK_LIBRARIES ob)
 # Add linked libraries
 target_link_libraries(${CMAKE_PROJECT_NAME}
     stm32cubemx
-
     # Add user defined libraries
 )
