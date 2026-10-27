@@ -70,7 +70,11 @@
 #define SD_RECORDING_CTL_BIT                (1<<2) 
 #define SD_RECORDING_STATUS_BIT             (1<<3)
 #define SD_RECORDING_ACTIVE                 (1<<4)
+#define SD_INITIALIZED_BIT                  (1<<5)
+#define SD_DMA_TX_COMPLETE_BIT              (1<<6)
 #define SD_RECORDING_STOPPED               0
+
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -113,7 +117,6 @@ extern char SDPath[4];   /* SD logical drive path */
 extern FATFS SDFatFS;    /* File system object for SD logical drive */
 extern FIL SDFile;       /* File object for SD */
 
-uint8_t init = 0;
 char UARTrxBuf[6];
 uint8_t buttonLongPressed;
 static WAV_HeaderTypeDef wavHeader={
@@ -164,6 +167,9 @@ SemaphoreHandle_t xLoggingSemaphore;
 
 EventGroupHandle_t xhFilesystemEventGroup;
 StaticEventGroup_t xFilesystemEventGroup;
+#define SD_CHECKFLAGS(x)                   (xEventGroupGetBits(xhFilesystemEventGroup) & x)
+
+SemaphoreHandle_t xSDBusyMutex;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -190,10 +196,11 @@ void traceTaskSwitch(void);
 /* USER CODE BEGIN 0 */
 void vLogMessage(const char* fmt, ...) {
     char buff[256];
+    snprintf(buff, sizeof(buff), "[%s Tick:%ld] ", pcTaskGetTaskName(NULL), xTaskGetTickCount());
     va_list args;
     va_start(args, fmt);
-    vsnprintf(buff, sizeof(buff), fmt, args);
-    xQueueSend(xhLoggingQueue, buff, 0); 
+    vsnprintf(buff+strlen(buff), (sizeof(buff)-strlen(buff)+1), fmt, args);
+    xQueueSend(xhLoggingQueue, buff, 100); 
     va_end(args);
 }
 
@@ -202,13 +209,14 @@ void UART_Printf(const char* buff){
 }
 
 void SD_Init() {
-
+  if(xSemaphoreTake(xSDBusyMutex, 10) == pdPASS)
+  {
     MX_FATFS_Init();
     vLogMessage("Initializing SD Card\r\n");
     retSD = f_mount(&SDFatFS, (TCHAR const*)SDPath, 0);
     if(retSD != FR_OK) {
         vLogMessage("f_mount() failed, retSD = %d\r\n", retSD);
-        return;
+        goto cleanup;
     }
 
     vLogMessage("f_mount() done!\r\n");
@@ -218,7 +226,7 @@ void SD_Init() {
     retSD = f_getfree((TCHAR const*)SDPath, &freeClust, &fs_ptr); // Warning! This fills SDFatFS.n_fatent and SDFatFS.csize!
     if(retSD != FR_OK) {
         vLogMessage("f_getfree() failed, retSD = %d\r\n", retSD);
-        return;
+        goto cleanup;
     }
 
     vLogMessage("f_getfree() done!\r\n");
@@ -233,7 +241,7 @@ void SD_Init() {
     retSD = f_opendir(&dir, "/");
     if(retSD != FR_OK) {
         vLogMessage("f_opendir() failed, retSD = %d\r\n", retSD);
-        return;
+        goto cleanup;
     }
 
     FILINFO fileInfo;
@@ -260,20 +268,31 @@ void SD_Init() {
     retSD = f_closedir(&dir);
     if(retSD != FR_OK) {
         vLogMessage("f_closedir() failed, retSD = %d\r\n", retSD);
-        return;
+        goto cleanup;
     }
 
-    init = 1;
     vLogMessage("SD Initialization Done!\r\n");
     BSP_LED_On(LED_GREEN);
+    xEventGroupSetBits(xhFilesystemEventGroup, SD_INITIALIZED_BIT);
+  } else {
+    vLogMessage("SD Busy, Failed to init");
+    goto cleanup;
+  }
+cleanup:
+    xSemaphoreGive(xSDBusyMutex);
+    return;
+
+    
 }
 
 void SD_DeInit(void){
+  xSemaphoreTake(xSDBusyMutex, portMAX_DELAY);
   FATFS_UnLinkDriver(SDPath);
   HAL_SD_DeInit(&hsd1);
   f_mount(&SDFatFS, SDPath, 0);
-  init = 0;
   vLogMessage("SD Card Deinitalized\r\n");
+  xEventGroupClearBits(xhFilesystemEventGroup, SD_INITIALIZED_BIT);
+  xSemaphoreGive(xSDBusyMutex);
 }
 /* USER CODE END 0 */
 
@@ -348,6 +367,7 @@ int main(void)
   /* add semaphores, ... */
   xFFTProcessingSemaphore = xSemaphoreCreateBinary();
   xLoggingSemaphore = xSemaphoreCreateBinary();
+  xSDBusyMutex = xSemaphoreCreateMutex();
   /* USER CODE END RTOS_SEMAPHORES */
 
   /* USER CODE BEGIN RTOS_TIMERS */
@@ -367,11 +387,11 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
-  xTaskCreate(vAudioProcessingTask, "Audio Processing", 256, NULL, 2, &AudioProcessingTaskHandle);
-  xTaskCreate(vSDCardCTLTask, "SD Control", 256, NULL, 1, &SDCardCTLTaskHandle);
+  xTaskCreate(vAudioProcessingTask, "Audio Processing", 256, NULL, 3, &AudioProcessingTaskHandle);
+  xTaskCreate(vSDCardCTLTask, "SD Control", 320, NULL, 2, &SDCardCTLTaskHandle);
   xTaskCreate(vSDRecordingTask, "SD Recording", 512, NULL, 3, &SDRecordingTaskHandle);
-  xTaskCreate(vFFTProcessingTask, "FFT Processing", 128, NULL, 2, &FFTProcessingTaskHandle);
-  xTaskCreate(vLoggingTask, "Logging Task", 256, NULL, 3, NULL);
+  xTaskCreate(vFFTProcessingTask, "FFT Processing", 320, NULL, 2, &FFTProcessingTaskHandle);
+  xTaskCreate(vLoggingTask, "Logging Task", 512, NULL, 2, NULL);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -566,7 +586,7 @@ static void MX_SDMMC1_SD_Init(void)
   hsd1.Init.ClockPowerSave = SDMMC_CLOCK_POWER_SAVE_DISABLE;
   hsd1.Init.BusWide = SDMMC_BUS_WIDE_1B;
   hsd1.Init.HardwareFlowControl = SDMMC_HARDWARE_FLOW_CONTROL_ENABLE;
-  hsd1.Init.ClockDiv = 2;
+  hsd1.Init.ClockDiv = 8;
   /* USER CODE BEGIN SDMMC1_Init 2 */
 
   /* USER CODE END SDMMC1_Init 2 */
@@ -769,7 +789,7 @@ void vAudioProcessingTask(void *argument){
       
     }
 
-    if(xEventGroupGetBits(xhFilesystemEventGroup) & SD_RECORDING_ACTIVE)
+    if(SD_CHECKFLAGS(SD_RECORDING_ACTIVE))
     {
       xStreamBufferSend(xhRecordingStream, packed_24bit_buf, AUDIO_BLOCK_LEN_WORDS*3, 0);
     }
@@ -779,27 +799,36 @@ void vAudioProcessingTask(void *argument){
 }
 
 void vFFTProcessingTask(void *argument){ // Control task responding to audio frequencies
+  uint8_t detected = 0;
   for(;;)
   {
+    
+    
     xSemaphoreTake(xFFTProcessingSemaphore, portMAX_DELAY);
+    float32_t mag = fft_magnitude[(1000+FFT_RESOLUTION)/FFT_RESOLUTION];
     // Process the FFT magnitude data here
-    if(fft_magnitude[1000/FFT_RESOLUTION] > 0.4f) {
-      vLogMessage("1kHz tone detected: %f\r\n", fft_magnitude[1000/FFT_RESOLUTION]);
+    if(mag > 0.6f && detected == 0) {
+      vLogMessage("1kHz tone start: %0.2f\r\n", mag);
+      detected = 1;
+    }else if(mag<0.6f && detected == 1){
+      vLogMessage("1kHz tone stop: %0.2f\r\n", mag);
+      detected  = 0;
     }
+
   }
 }
 
 void vSDCardCTLTask(void *argument){  // Control Task for SD Card events (connect, eject, recording control)
   EventBits_t bits;
   
-  if(BSP_SD_IsDetected() && (init == 0))
+  if(BSP_SD_IsDetected())
   {
     SD_Init();
   }
   for(;;)
   {
     bits = xEventGroupWaitBits(xhFilesystemEventGroup, SD_CONNECTION_EVENT_BIT | SD_EJECT_BIT | SD_RECORDING_CTL_BIT, pdTRUE, pdFALSE, portMAX_DELAY);
-    if(bits & SD_RECORDING_CTL_BIT && BSP_SD_IsDetected() && (init == 1))
+    if((bits & SD_RECORDING_CTL_BIT ) && (bits & SD_INITIALIZED_BIT) && BSP_SD_IsDetected())
     {
 
       if(!(bits & SD_RECORDING_ACTIVE)){
@@ -818,11 +847,11 @@ void vSDCardCTLTask(void *argument){  // Control Task for SD Card events (connec
     if(bits & SD_CONNECTION_EVENT_BIT)
     {
       vTaskDelay(pdMS_TO_TICKS(500));
-      if(BSP_SD_IsDetected() && (init == 0))
+      if(BSP_SD_IsDetected() && !(bits & SD_INITIALIZED_BIT))
       {  
         vLogMessage("SD Card Connected\r\n");
         SD_Init();
-      }else if (!BSP_SD_IsDetected()){
+      }else if (!BSP_SD_IsDetected() && (bits & SD_INITIALIZED_BIT)){
         vLogMessage("SD Card Disconnected\r\n");
         SD_DeInit();
       }
@@ -836,7 +865,7 @@ void vSDRecordingTask(void *argument)
   FIL wavFile;
   UINT bytesWritten;
   uint32_t total_audio_bytes;
-
+  uint8_t ret;
   char filename[16];
 
   for(;;)
@@ -844,47 +873,62 @@ void vSDRecordingTask(void *argument)
     xEventGroupWaitBits(xhFilesystemEventGroup, SD_RECORDING_ACTIVE, pdFALSE, pdTRUE, portMAX_DELAY);
 
     GetNextFileName(filename);
-
-    retSD = f_open(&wavFile, filename, FA_WRITE | FA_CREATE_ALWAYS);
-    if(retSD != FR_OK)
+    xSemaphoreTake(xSDBusyMutex, portMAX_DELAY);
+    ret = f_open(&wavFile, filename, FA_WRITE | FA_CREATE_ALWAYS);
+    xSemaphoreGive(xSDBusyMutex);
+    if(ret != FR_OK)
     {
       vLogMessage("Failed to open file %s. retSD = %d\r\n", filename, retSD );
-      Error_Handler();
+      xEventGroupClearBits(xhFilesystemEventGroup, SD_RECORDING_ACTIVE);
+      continue;
     }
     vLogMessage("Creating recording %s\r\n", filename);
+
     // reserve the 44-byte header; it gets rewritten with real sizes at the end
-    f_write(&wavFile, &wavHeader, sizeof(WAV_HeaderTypeDef), &bytesWritten);
+    xSemaphoreTake(xSDBusyMutex, portMAX_DELAY);
+    ret = f_write(&wavFile, &wavHeader, sizeof(WAV_HeaderTypeDef), &bytesWritten);
+    xSemaphoreGive(xSDBusyMutex);
+    if (ret != FR_OK)
+    {
+      vLogMessage("Failed to write wavHeader. retSD = %d\r\n", ret);
+    }
+
     wavHeader.chunk_size = 0; 
     wavHeader.data_chunk_size = 0;
     total_audio_bytes = 0;
     while(1)
     {
-      size_t ret = xStreamBufferReceive(xhRecordingStream, raw_audio_samples2,
-                                        sizeof(raw_audio_samples2), pdMS_TO_TICKS(100));
-      if (ret > 0)
+      size_t bytes = xStreamBufferReceive(xhRecordingStream, raw_audio_samples2, sizeof(raw_audio_samples2), pdMS_TO_TICKS(100));
+      if (bytes > 0)
       {
 #ifdef PROFILING
         xTracePrint(RecordingProfiler, "f_write start");
-#endif
-        retSD = f_write(&wavFile, raw_audio_samples2, ret, &bytesWritten);
+#endif  
+        xSemaphoreTake(xSDBusyMutex, portMAX_DELAY);
+        ret = f_write(&wavFile, raw_audio_samples2, bytes, &bytesWritten);
+        xSemaphoreGive(xSDBusyMutex);
 #ifdef PROFILING
        xTracePrint(RecordingProfiler, "f_write stop");
 #endif
-        if (retSD != FR_OK)
-        {
-          vLogMessage("Failed to write file. retSD = %d\r\n", retSD);
-        }
+      if (ret != FR_OK) {
+        vLogMessage("Failed to write. retSD = %d",  ret);
+      }
         total_audio_bytes += bytesWritten;
       }
 
-      if (!(xEventGroupGetBits(xhFilesystemEventGroup) & SD_RECORDING_ACTIVE))
+      if (!SD_CHECKFLAGS(SD_RECORDING_ACTIVE))
       {
         vLogMessage("Stop bit detected! Exiting recording loop.\r\n");
         size_t rest;
-        while ((rest = xStreamBufferReceive(xhRecordingStream, raw_audio_samples2,
-                                            sizeof(raw_audio_samples2), 0)) > 0)
+        while ((rest = xStreamBufferReceive(xhRecordingStream, raw_audio_samples2, sizeof(raw_audio_samples2), 0)) > 0)
         {
-          retSD = f_write(&wavFile, raw_audio_samples2, rest, &bytesWritten);
+          xSemaphoreTake(xSDBusyMutex, portMAX_DELAY);
+          ret = f_write(&wavFile, raw_audio_samples2, rest, &bytesWritten);
+          xSemaphoreGive(xSDBusyMutex);
+          if (ret != FR_OK)
+          {
+            vLogMessage("Failed to write remaining bytes. retSD = %d\r\n", ret);
+          }
           total_audio_bytes += bytesWritten;
         }
         break;
@@ -895,42 +939,83 @@ void vSDRecordingTask(void *argument)
     wavHeader.chunk_size = 36 + total_audio_bytes;
 
     // Move file pointer back to byte 0 and overwrite the updated header
-    retSD = f_lseek(&wavFile, 0);
-    if(retSD != FR_OK)
+    xSemaphoreTake(xSDBusyMutex, portMAX_DELAY);
+    ret = f_lseek(&wavFile, 0);
+    if(ret != FR_OK)
     {
-      vLogMessage("Failed to seek. retSD = %d\r\n", retSD );
-      // Error_Handler();
+      vLogMessage("Failed to seek. retSD = %d\r\n", ret );
+
     }
-    retSD = f_write(&wavFile, &wavHeader, sizeof(WAV_HeaderTypeDef), &bytesWritten);
-    if(retSD != FR_OK)
+    ret = f_write(&wavFile, &wavHeader, sizeof(WAV_HeaderTypeDef), &bytesWritten);
+    
+    if(ret != FR_OK)
     {
-      vLogMessage("Failed to write file %s. retSD = %d\r\n", filename, retSD );
-      //Error_Handler();
+      vLogMessage("Failed to write final wavHeader. retSD = %d\r\n", ret );
+
     }
-    // 8. Safely commit and close
-    vTaskDelay(10);
+    // Safely commit and close
     vLogMessage( "Closing file %s with %d bytes.\r\n", filename, total_audio_bytes );
     
 
-    retSD = f_close(&wavFile);
-    if(retSD != FR_OK)
+    ret = f_close(&wavFile);
+    if(ret != FR_OK)
     {
-      vLogMessage("Failed to close file %s. retSD = %d\r\n", filename, retSD );
-      Error_Handler();
+      vLogMessage("Failed to close file %s. retSD = %d\r\n", filename, ret );
+
     }
     vLogMessage("Closed file %s.\r\n", filename);
-   
+    xSemaphoreGive(xSDBusyMutex);
   }
 }
 
 void vLoggingTask(void *argument)
 {
   char Message[256];
+  FIL LogFile;
+  FRESULT ret_open = FR_NOT_READY;
+  UINT bytesWritten;
+ 
   for(;;)
   {
+
+    if(SD_CHECKFLAGS(SD_INITIALIZED_BIT))
+    {
+      if(ret_open != FR_OK)
+      {
+        xSemaphoreTake(xSDBusyMutex, portMAX_DELAY);
+        ret_open = f_open(&LogFile, "log.txt", FA_CREATE_ALWAYS | FA_WRITE);
+        xSemaphoreGive(xSDBusyMutex);
+        if(ret_open != FR_OK)
+        {
+          UART_Printf("log file faled to open\r\n");
+        }
+      }
+    }else {
+      ret_open = FR_NOT_READY;
+    }
+
     if(xQueueReceive(xhLoggingQueue, Message, portMAX_DELAY) == pdPASS)
     {
       UART_Printf(Message);
+      if(ret_open == FR_OK && SD_CHECKFLAGS(SD_INITIALIZED_BIT) && !SD_CHECKFLAGS(SD_RECORDING_ACTIVE))
+      {
+        if(xSemaphoreTake(xSDBusyMutex, portMAX_DELAY)==pdPASS)
+        {
+          if(f_write(&LogFile, Message, strlen(Message), &bytesWritten) != FR_OK)
+          {
+            vLogMessage("f_write failed in Logging Task\r\n");
+          }else{
+            f_sync(&LogFile);
+          }
+          xSemaphoreGive(xSDBusyMutex);
+        }else{
+          vLogMessage("SD Busy, failed to write message\r\n");
+        }
+        
+        
+      }
+
+      
       xSemaphoreTake(xLoggingSemaphore, portMAX_DELAY);
 
     }
@@ -1003,6 +1088,7 @@ uint8_t BSP_SD_WriteBlocks_DMA(uint32_t *pData, uint32_t WriteAddr, uint32_t Num
  
  return sd_state;
 }
+
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
