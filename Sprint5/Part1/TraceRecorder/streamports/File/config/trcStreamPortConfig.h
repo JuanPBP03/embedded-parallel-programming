@@ -37,7 +37,7 @@ extern "C" {
  *
  * @brief Configures the size of the internal buffer if used.
  */
-#define TRC_CFG_STREAM_PORT_INTERNAL_BUFFER_SIZE 15240
+#define TRC_CFG_STREAM_PORT_INTERNAL_BUFFER_SIZE 10240
 
 /**
  * @def TRC_CFG_STREAM_PORT_INTERNAL_BUFFER_TRANSFER_MODE

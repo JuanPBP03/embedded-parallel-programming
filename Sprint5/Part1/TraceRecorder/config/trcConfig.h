@@ -134,7 +134,7 @@ extern "C" {
  *
  * Default value is 1.
  */
-#define TRC_CFG_INCLUDE_OSTICK_EVENTS 1
+#define TRC_CFG_INCLUDE_OSTICK_EVENTS 0
 
 /**
  * @def TRC_CFG_ENTRY_SLOTS
@@ -256,7 +256,7 @@ extern "C" {
  * The unit depends on the delay function used for the specific kernel port (trcKernelPort.c).
  * For example, FreeRTOS uses ticks while Zephyr uses ms.
  */
-#define TRC_CFG_CTRL_TASK_DELAY 10
+#define TRC_CFG_CTRL_TASK_DELAY 5
 
 /**
  * @def TRC_CFG_CTRL_TASK_STACK_SIZE

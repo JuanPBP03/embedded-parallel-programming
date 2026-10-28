@@ -39,7 +39,7 @@ extern FIL SDFile; /* File object for SD */
 void MX_FATFS_Init(void);
 
 /* USER CODE BEGIN Prototypes */
-void GetNextFileName(char *filename);
+void GetNextFileName(char *filename, size_t len, const TCHAR *path);
 #pragma pack(push, 1)
 typedef struct {
     char        riff_chunk_id[4];   // "RIFF"

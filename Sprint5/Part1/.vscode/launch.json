@@ -5,7 +5,7 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "type": "stlinkgdbtarget",
+            "type": "jlinkgdbtarget",
             "request": "launch",
             "name": "STM32Cube: Launch ST-Link GDB Server",
             "origin": "snippet",

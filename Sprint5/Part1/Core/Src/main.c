@@ -24,9 +24,12 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "FreeRTOS.h"
+#include "ff.h"
 #include "portmacro.h"
+#include "projdefs.h"
 #include "stm32l476xx.h"
 #include "stm32l4xx_hal_def.h"
+#include "stm32l4xx_hal_dma.h"
 #include "stm32l4xx_hal_uart.h"
 #include "stm32l4xx_nucleo.h"
 #include "task.h"
@@ -38,6 +41,8 @@
 #include "event_groups.h"
 #include "semphr.h"
 #include "stream_buffer.h"
+#include "trcDefines.h"
+#include <sys/_intsup.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -48,22 +53,26 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define PROFILING
-#define DMA_BUF_SIZE                       1024
+#define DMA_BUF_SIZE                       2048
 #define AUDIO_BLOCK_LEN_WORDS             (DMA_BUF_SIZE/2)
 #define AUDIO_BLOCK_SIZE_BYTES            (AUDIO_BLOCK_LEN_WORDS*4)
-#define FFT_LENGTH                         AUDIO_BLOCK_LEN_WORDS
+#define FFT_LENGTH                        (DMA_BUF_SIZE/2)
 #define FFT_MAG_LEN                       (FFT_LENGTH/2)
-#define FFT_MAG_LEN_BYTES                 (FFT_MAG_LEN*4)
-#define SAMPLE_RATE                        44117.0f
-#define FFT_RESOLUTION                    (int)(SAMPLE_RATE/FFT_LENGTH) // 44100/256 = 172.265625 Hz
 
-#define AUDIO_QUEUE_LEN                    4
-#define AUDIO_QUEUE_SIZE                  (AUDIO_QUEUE_LEN*AUDIO_BLOCK_SIZE_BYTES)
+#define SAMPLE_RATE                        44117.0f
+#define FFT_BIN_HZ_FLOAT                   (SAMPLE_RATE / FFT_LENGTH)
+#define HANN_COHERENT_GAIN                 0.5f
+#define FFT_SCALE                         (2.0f / (FFT_LENGTH * HANN_COHERENT_GAIN))
+#define SEARCH_RADIUS_BINS                 2
+#define FALL_CRICKET_FREQ                  4200.0f
+#define SOUTHEASTERN_CRICKET_FREQ          4700.0f
+#define REF_LO_BIN                        ((uint32_t)(900.0f   / FFT_BIN_HZ_FLOAT))
+#define REF_HI_BIN                        ((uint32_t)(16000.0f / FFT_BIN_HZ_FLOAT))
+// #define AUDIO_QUEUE_LEN                    4
+// #define AUDIO_QUEUE_SIZE                  (AUDIO_QUEUE_LEN*AUDIO_BLOCK_SIZE_BYTES)
 
 #define RECORDING_STREAM_SIZE              8192
-#define RECORDING_STREAM_TRIGGER_LVL       (RECORDING_STREAM_SIZE/2)
-
-#define FFT_QUEUE_LEN                      4
+#define RECORDING_STREAM_TRIGGER_LVL       (4096)
 
 #define SD_CONNECTION_EVENT_BIT             (1<<0)
 #define SD_EJECT_BIT                        (1<<1)
@@ -71,8 +80,7 @@
 #define SD_RECORDING_STATUS_BIT             (1<<3)
 #define SD_RECORDING_ACTIVE                 (1<<4)
 #define SD_INITIALIZED_BIT                  (1<<5)
-#define SD_DMA_TX_COMPLETE_BIT              (1<<6)
-#define SD_RECORDING_STOPPED               0
+#define SD_ERROR_REINITRQ_BIT               (1<<6)
 
 
 /* USER CODE END PD */
@@ -112,11 +120,10 @@ TraceStringHandle_t RecordingProfiler;
 TraceStringHandle_t FFTProfiler;
 #endif
 
-extern uint8_t retSD;    /* Return value for SD */
 extern char SDPath[4];   /* SD logical drive path */
 extern FATFS SDFatFS;    /* File system object for SD logical drive */
-extern FIL SDFile;       /* File object for SD */
 
+uint8_t recordingFolderExists;
 char UARTrxBuf[6];
 uint8_t buttonLongPressed;
 static WAV_HeaderTypeDef wavHeader={
@@ -136,9 +143,9 @@ static WAV_HeaderTypeDef wavHeader={
 };
 
 
-int32_t raw_audio_samples[AUDIO_BLOCK_LEN_WORDS] __attribute__((aligned(4))) __attribute__((section(".ram2")));
+//int32_t raw_audio_samples[AUDIO_BLOCK_LEN_WORDS] __attribute__((aligned(4)));
 uint8_t raw_audio_samples2[RECORDING_STREAM_TRIGGER_LVL] __attribute__((aligned(4))) __attribute__((section(".ram2")));
-uint8_t packed_24bit_buf[ AUDIO_BLOCK_LEN_WORDS * 3 ] __attribute__((aligned(4))) __attribute__((section(".ram2")));
+uint8_t packed_24bit_buf[ AUDIO_BLOCK_LEN_WORDS * 3 ] __attribute__((aligned(4)))__attribute__((section(".ram2")));
 int32_t DMA_buf[DMA_BUF_SIZE] __attribute__((aligned(4))) __attribute__((section(".ram2")));
 
 arm_rfft_fast_instance_f32 xFFT_instance;
@@ -146,15 +153,16 @@ arm_rfft_fast_instance_f32 xFFT_instance;
 float32_t fft_input[FFT_LENGTH];
 float32_t fft_output[FFT_LENGTH];
 float32_t fft_magnitude[FFT_MAG_LEN];
+float32_t hann_window[FFT_LENGTH]__attribute__((section(".ram2")));
 
 TaskHandle_t AudioProcessingTaskHandle;
 TaskHandle_t FFTProcessingTaskHandle;
 TaskHandle_t SDCardCTLTaskHandle;
 TaskHandle_t SDRecordingTaskHandle;
 
-StaticQueue_t xAudioQueue;
-QueueHandle_t xhAudioQueue;
-uint8_t AudioQueueStorageBuffer[AUDIO_QUEUE_SIZE] __attribute__((section(".ram2")));
+// StaticQueue_t xAudioQueue;
+// QueueHandle_t xhAudioQueue;
+// uint8_t AudioQueueStorageBuffer[AUDIO_QUEUE_SIZE] __attribute__((section(".ram2")));
 
 SemaphoreHandle_t xFFTProcessingSemaphore;
 
@@ -167,9 +175,11 @@ SemaphoreHandle_t xLoggingSemaphore;
 
 EventGroupHandle_t xhFilesystemEventGroup;
 StaticEventGroup_t xFilesystemEventGroup;
-#define SD_CHECKFLAGS(x)                   (xEventGroupGetBits(xhFilesystemEventGroup) & x)
+#define SD_CHECKFLAGS(x)                   ((xEventGroupGetBits(xhFilesystemEventGroup) & (x))==(x))
 
+#define HOLDING_MUTEX(x)                   (xSemaphoreGetMutexHolder(x) == xTaskGetCurrentTaskHandle())
 SemaphoreHandle_t xSDBusyMutex;
+SemaphoreHandle_t xRecordingMutex;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -189,19 +199,29 @@ void vFFTProcessingTask(void *argument);
 void vSDCardCTLTask(void *argument);
 void vSDRecordingTask(void *argument);
 void vLoggingTask(void *argument);
-void traceTaskSwitch(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+static void Window_Init(void)
+{
+  for (uint32_t n = 0; n < FFT_LENGTH; n++)
+  {
+    // Periodic Hann, as used for spectral analysis
+    hann_window[n] = 0.5f * (1.0f - arm_cos_f32(2.0f * PI * n / FFT_LENGTH));
+  }
+}
+
 void vLogMessage(const char* fmt, ...) {
-    char buff[256];
-    snprintf(buff, sizeof(buff), "[%s Tick:%ld] ", pcTaskGetTaskName(NULL), xTaskGetTickCount());
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(buff+strlen(buff), (sizeof(buff)-strlen(buff)+1), fmt, args);
-    xQueueSend(xhLoggingQueue, buff, 100); 
-    va_end(args);
+  char buff[256];
+  snprintf(buff, sizeof(buff), "[%s Tick:%ld] ", pcTaskGetTaskName(NULL), xTaskGetTickCount());
+  va_list args;
+  va_start(args, fmt);
+  size_t len = strlen(buff);
+  vsnprintf(buff+len, (sizeof(buff)-len), fmt, args);
+  xQueueSend(xhLoggingQueue, buff, 100); 
+  va_end(args);
 }
 
 void UART_Printf(const char* buff){
@@ -209,7 +229,8 @@ void UART_Printf(const char* buff){
 }
 
 void SD_Init() {
-  if(xSemaphoreTake(xSDBusyMutex, 10) == pdPASS)
+  recordingFolderExists = 0;
+  if(xSemaphoreTake(xSDBusyMutex, 100) == pdPASS)
   {
     MX_FATFS_Init();
     vLogMessage("Initializing SD Card\r\n");
@@ -247,7 +268,8 @@ void SD_Init() {
     FILINFO fileInfo;
     uint32_t totalFiles = 0;
     uint32_t totalDirs = 0;
-    vLogMessage("--------\r\nRoot directory:\r\n");
+    vLogMessage("--------\r\n");
+    vLogMessage("Root directory:\r\n");
     for(;;) {
         retSD = f_readdir(&dir, &fileInfo);
         if((retSD != FR_OK) || (fileInfo.fname[0] == '\0')) {
@@ -256,21 +278,35 @@ void SD_Init() {
         
         if(fileInfo.fattrib & AM_DIR) {
             vLogMessage("  DIR  %s\r\n", fileInfo.fname);
+            if (strcmp(fileInfo.fname, "recordings")==0)
+              recordingFolderExists = 1;
             totalDirs++;
         } else {
             vLogMessage("  FILE %s\r\n", fileInfo.fname);
             totalFiles++;
         }
     }
-
-    vLogMessage("(total: %lu dirs, %lu files)\r\n--------\r\n", totalDirs, totalFiles);
-
+    
+    vLogMessage("(total: %lu dirs, %lu files)\r\n", totalDirs, totalFiles);
+    vLogMessage("--------\r\n");
     retSD = f_closedir(&dir);
     if(retSD != FR_OK) {
         vLogMessage("f_closedir() failed, retSD = %d\r\n", retSD);
         goto cleanup;
     }
+    if(!recordingFolderExists)
+    {
+      retSD = f_mkdir("recordings");
+      if(retSD == FR_OK || retSD == FR_EXIST)
+      {
+       recordingFolderExists = 1;
 
+      }else{
+        vLogMessage("Could not create recordings folder. Recording in Root Directory\r\n");
+
+      }
+      
+    }
     vLogMessage("SD Initialization Done!\r\n");
     BSP_LED_On(LED_GREEN);
     xEventGroupSetBits(xhFilesystemEventGroup, SD_INITIALIZED_BIT);
@@ -287,6 +323,7 @@ cleanup:
 
 void SD_DeInit(void){
   xSemaphoreTake(xSDBusyMutex, portMAX_DELAY);
+  recordingFolderExists = 0;
   FATFS_UnLinkDriver(SDPath);
   HAL_SD_DeInit(&hsd1);
   f_mount(&SDFatFS, SDPath, 0);
@@ -305,7 +342,7 @@ int main(void)
 
   /* USER CODE BEGIN 1 */
 #ifdef PROFILING
-  xTraceEnable(TRC_START);
+  xTraceEnable(TRC_START_FROM_HOST);
 
   RecordingProfiler = xTraceRegisterString("Recording Channel");
   FFTProfiler = xTraceRegisterString("FFT Profiler");
@@ -339,6 +376,7 @@ int main(void)
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
   arm_rfft_fast_init_f32(&xFFT_instance, FFT_LENGTH);
+  Window_Init();
   char *buf = "Provide date as DDMMYY:\r\n";
   HAL_UART_Transmit(&huart2, (uint8_t*)buf, strlen(buf), HAL_MAX_DELAY);
   HAL_UART_Receive(&huart2, (uint8_t*)UARTrxBuf, 6, HAL_MAX_DELAY);
@@ -368,6 +406,7 @@ int main(void)
   xFFTProcessingSemaphore = xSemaphoreCreateBinary();
   xLoggingSemaphore = xSemaphoreCreateBinary();
   xSDBusyMutex = xSemaphoreCreateMutex();
+  xRecordingMutex = xSemaphoreCreateMutex();
   /* USER CODE END RTOS_SEMAPHORES */
 
   /* USER CODE BEGIN RTOS_TIMERS */
@@ -377,7 +416,7 @@ int main(void)
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
   xhRecordingStream = xStreamBufferCreateStatic(RECORDING_STREAM_SIZE, RECORDING_STREAM_TRIGGER_LVL, RecordingStreamStorageBuffer, &xRecordingStream);
-  xhAudioQueue = xQueueCreateStatic(AUDIO_QUEUE_LEN, sizeof(raw_audio_samples), AudioQueueStorageBuffer, &xAudioQueue);
+  //xhAudioQueue = xQueueCreateStatic(AUDIO_QUEUE_LEN, sizeof(raw_audio_samples), AudioQueueStorageBuffer, &xAudioQueue);
   xhLoggingQueue = xQueueCreate(20, sizeof(char[256]));
   /* USER CODE END RTOS_QUEUES */
 
@@ -387,8 +426,9 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
+  
   xTaskCreate(vAudioProcessingTask, "Audio Processing", 256, NULL, 3, &AudioProcessingTaskHandle);
-  xTaskCreate(vSDCardCTLTask, "SD Control", 320, NULL, 2, &SDCardCTLTaskHandle);
+  xTaskCreate(vSDCardCTLTask, "SD Control", 512, NULL, 2, &SDCardCTLTaskHandle);
   xTaskCreate(vSDRecordingTask, "SD Recording", 512, NULL, 3, &SDRecordingTaskHandle);
   xTaskCreate(vFFTProcessingTask, "FFT Processing", 320, NULL, 2, &FFTProcessingTaskHandle);
   xTaskCreate(vLoggingTask, "Logging Task", 512, NULL, 2, NULL);
@@ -658,7 +698,7 @@ static void MX_USART2_UART_Init(void)
 
   /* USER CODE END USART2_Init 1 */
   huart2.Instance = USART2;
-  huart2.Init.BaudRate = 115200;
+  huart2.Init.BaudRate = 230400;
   huart2.Init.WordLength = UART_WORDLENGTH_8B;
   huart2.Init.StopBits = UART_STOPBITS_1;
   huart2.Init.Parity = UART_PARITY_NONE;
@@ -758,17 +798,29 @@ static void MX_GPIO_Init(void)
 void vAudioProcessingTask(void *argument){
   
   HAL_SAI_Receive_DMA(&hsai_BlockA2, (uint8_t*)DMA_buf, DMA_BUF_SIZE);
+  int32_t *data;
   for(;;)
   {
-    xQueueReceive(xhAudioQueue, raw_audio_samples, portMAX_DELAY);
-    
+    //xQueueReceive(xhAudioQueue, raw_audio_samples, portMAX_DELAY);
+      BaseType_t AudioDMAHalf = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-    if(raw_audio_samples[0]!=0)
+      switch(AudioDMAHalf)
+      {
+        case 0:
+          continue;
+        case 1:
+          data = DMA_buf;
+          break;
+        case 2:
+          data = DMA_buf+AUDIO_BLOCK_LEN_WORDS;
+      }
+
+    if(data[0]!=0)
     {
-      for(uint32_t i=0;i<FFT_LENGTH;i++)
+      for(uint32_t i=0;i<AUDIO_BLOCK_LEN_WORDS;i++)
       {
 
-        int32_t signed_sample = ((int32_t)raw_audio_samples[i] << 8) >> 8; // EXTEND SIGN BIT FROM 24 BIT WORDS
+        int32_t signed_sample = ((int32_t)data[i] << 8) >> 8; // EXTEND SIGN BIT FROM 24 BIT WORDS
 
         fft_input[i] = signed_sample / 8388608.0f; // NORMALIZE TO FLOAT DIVIDING BY 2**23
 
@@ -776,69 +828,179 @@ void vAudioProcessingTask(void *argument){
         packed_24bit_buf[3*i+1] = (uint8_t)((signed_sample >> 8) & 0xFF);  
         packed_24bit_buf[3*i+2] = (uint8_t)((signed_sample >> 16) & 0xFF); 
       }
-#ifdef PROFILING
-      xTracePrint(FFTProfiler, "FFT Start");
-#endif
-      arm_rfft_fast_f32(&xFFT_instance, fft_input, fft_output, 0);
-      arm_cmplx_mag_f32(&fft_output[2], &fft_magnitude[1], FFT_MAG_LEN-1);
-#ifdef PROFILING
-      xTracePrint(FFTProfiler, "FFT Stop");
-#endif
-      fft_magnitude[0] = fabsf(fft_output[0]); // fft_output[0] is already real
 
-      
+      if(SD_CHECKFLAGS(SD_RECORDING_ACTIVE))
+      {
+        xStreamBufferSend(xhRecordingStream, packed_24bit_buf, AUDIO_BLOCK_LEN_WORDS*3, 0);
+      }
+
+#ifdef PROFILING
+        xTracePrint(FFTProfiler, "FFT Start");
+#endif
+        arm_mult_f32(fft_input, hann_window, fft_input, FFT_LENGTH);
+        arm_rfft_fast_f32(&xFFT_instance, fft_input, fft_output, 0);
+        arm_cmplx_mag_f32(&fft_output[2], &fft_magnitude[1], FFT_MAG_LEN-1);
+
+#ifdef PROFILING
+        xTracePrint(FFTProfiler, "FFT Stop");
+#endif
+        fft_magnitude[0] = fabsf(fft_output[0]); // fft_output[0] is already real
+
+        arm_scale_f32(fft_magnitude, FFT_SCALE, fft_magnitude, FFT_MAG_LEN);
+        fft_magnitude[0] *= 0.5f;   // DC only needs 1/(N * gain), not 2/(N * gain)
+        xSemaphoreGive(xFFTProcessingSemaphore);
+
+
     }
 
-    if(SD_CHECKFLAGS(SD_RECORDING_ACTIVE))
-    {
-      xStreamBufferSend(xhRecordingStream, packed_24bit_buf, AUDIO_BLOCK_LEN_WORDS*3, 0);
-    }
 
-    xSemaphoreGive(xFFTProcessingSemaphore);
+
+    
   }
 }
 
-void vFFTProcessingTask(void *argument){ // Control task responding to audio frequencies
-  uint8_t detected = 0;
+void vFFTProcessingTask(void *argument)
+{ // Control task responding to audio frequencies
+  
+  TickType_t lastDetected1 = xTaskGetTickCount();
+  TickType_t lastDetected2 = xTaskGetTickCount();
+  uint8_t detected1 = 0;
+  uint8_t detected2 = 0;
+  uint32_t k1 = (uint32_t)(SOUTHEASTERN_CRICKET_FREQ / FFT_BIN_HZ_FLOAT + 0.5f);
+  uint32_t k2 = (uint32_t)(FALL_CRICKET_FREQ / FFT_BIN_HZ_FLOAT + 0.5f);
+  float32_t peak1, peak2;
+  uint32_t idx1, idx2;
+  uint8_t recordingAttempted=0;
+  float32_t floor1 = -70.0f, floor2 = -70.0f;   // learned noise floor per band (dB)
+  uint32_t blocks = 0;
+  uint8_t hist1 = 0, hist2 = 0;
   for(;;)
   {
-    
-    
+
     xSemaphoreTake(xFFTProcessingSemaphore, portMAX_DELAY);
-    float32_t mag = fft_magnitude[(1000+FFT_RESOLUTION)/FFT_RESOLUTION];
-    // Process the FFT magnitude data here
-    if(mag > 0.6f && detected == 0) {
-      vLogMessage("1kHz tone start: %0.2f\r\n", mag);
-      detected = 1;
-    }else if(mag<0.6f && detected == 1){
-      vLogMessage("1kHz tone stop: %0.2f\r\n", mag);
-      detected  = 0;
+    taskENTER_CRITICAL();
+    arm_max_f32(&fft_magnitude[k1-SEARCH_RADIUS_BINS], (2*SEARCH_RADIUS_BINS)+1, &peak1, &idx1);
+    arm_max_f32(&fft_magnitude[k2-SEARCH_RADIUS_BINS], (2*SEARCH_RADIUS_BINS)+1, &peak2, &idx2);
+    taskEXIT_CRITICAL();
+
+    float32_t mean_all;
+    arm_mean_f32(&fft_magnitude[REF_LO_BIN], REF_HI_BIN-REF_LO_BIN, &mean_all);   // ~860 Hz to ~18 kHz
+
+    float32_t mag1  = 20.0f*log10f(peak1 + 1e-12f);
+    float32_t mag2  = 20.0f*log10f(peak2 + 1e-12f);
+    float32_t prom1 = mag1 - 20.0f*log10f(mean_all + 1e-12f);   // how much the peak stands out
+    float32_t prom2 = mag2 - 20.0f*log10f(mean_all + 1e-12f);
+
+    uint8_t hit1 = blocks > (uint32_t)(3.0f * SAMPLE_RATE / FFT_LENGTH) && mag1 >= floor1 + 6.0f && prom1 >= 15.0f;   // skip first ~3 s
+    uint8_t hit2 = blocks > (uint32_t)(3.0f * SAMPLE_RATE / FFT_LENGTH) && mag2 >= floor2 + 6.0f && prom2 >= 15.0f;
+    
+    hist1 = (hist1 << 1) | hit1;
+    hist2 = (hist2 << 1) | hit2;
+
+    uint8_t cricket1 = __builtin_popcount(hist1) >= 5;
+    uint8_t cricket2 = __builtin_popcount(hist2) >= 5;
+
+    float32_t a1 = hit1 ? 0.0005f : 0.01f;   // adapt slowly during hits, ~2 s otherwise
+    float32_t a2 = hit2 ? 0.0005f : 0.01f;
+    floor1 += a1 * (mag1 - floor1);
+    floor2 += a2 * (mag2 - floor2);
+    blocks++;
+    
+    if(cricket1)
+    {
+      if(detected1 == 0)
+      {
+        vLogMessage("Detected Southeastern Field Cricket: %0.2f dBFS\r\n", mag1);
+        detected1 = 1;
+      }
+      lastDetected1 = xTaskGetTickCount();
+    }else if ((xTaskGetTickCount() - lastDetected1) > pdMS_TO_TICKS(2000) && detected1 == 1) {
+      vLogMessage("Lost Southeastern Field Cricket: %0.2f dBFS. Last detected: %ld\r\n", mag1, lastDetected1);
+      detected1 = 0;
     }
 
+    if(cricket2)
+    {
+      if(detected2 == 0)
+      {
+        vLogMessage("Detected Fall Field Cricket: %0.2f dBFS\r\n", mag2);
+        detected2 = 1;
+      }
+      lastDetected2 = xTaskGetTickCount();
+    }else if (((xTaskGetTickCount() - lastDetected2) > pdMS_TO_TICKS(2000)) && detected2 == 1) {
+      vLogMessage("Lost Fall Field Cricket: %0.2f dBFS. Last detected: %ld\r\n", mag2, lastDetected2);
+      detected2 = 0;
+    }
+
+    uint8_t active = SD_CHECKFLAGS(SD_RECORDING_ACTIVE);
+    uint8_t want   = (detected1 || detected2);
+    uint8_t own    = HOLDING_MUTEX(xRecordingMutex);
+
+    if (own) 
+    {
+      if (!active) 
+      {                      // recorder stopped on its own
+        vLogMessage("Recording stopped unexpectedly\r\n");
+        xSemaphoreGive(xRecordingMutex);
+      } else if (!want) 
+      {                 // crickets gone
+        xEventGroupClearBits(xhFilesystemEventGroup, SD_RECORDING_ACTIVE);
+        vLogMessage("Crickets lost, recording stopped\r\n");
+        xSemaphoreGive(xRecordingMutex);
+      }
+    } else if (want) 
+    {
+      if (xSemaphoreTake(xRecordingMutex, 0) == pdPASS) 
+      {
+        xEventGroupSetBits(xhFilesystemEventGroup, SD_RECORDING_ACTIVE);
+        vLogMessage("Cricket detected, recording started\r\n");
+      } else if (!recordingAttempted) {
+        vLogMessage("Recording already in progress\r\n");
+        recordingAttempted = 1;
+      }
+    }
+
+    if (!own && !active) recordingAttempted = 0;
+     
   }
+  
 }
 
 void vSDCardCTLTask(void *argument){  // Control Task for SD Card events (connect, eject, recording control)
   EventBits_t bits;
-  
   if(BSP_SD_IsDetected())
   {
     SD_Init();
   }
   for(;;)
   {
-    bits = xEventGroupWaitBits(xhFilesystemEventGroup, SD_CONNECTION_EVENT_BIT | SD_EJECT_BIT | SD_RECORDING_CTL_BIT, pdTRUE, pdFALSE, portMAX_DELAY);
-    if((bits & SD_RECORDING_CTL_BIT ) && (bits & SD_INITIALIZED_BIT) && BSP_SD_IsDetected())
-    {
+    bits = xEventGroupWaitBits(xhFilesystemEventGroup, SD_CONNECTION_EVENT_BIT | SD_EJECT_BIT | SD_RECORDING_CTL_BIT | SD_ERROR_REINITRQ_BIT, pdTRUE, pdFALSE, portMAX_DELAY);
+    
+    if (HOLDING_MUTEX(xRecordingMutex) && !SD_CHECKFLAGS(SD_RECORDING_ACTIVE)) {
+      vLogMessage("Recording stopped unexpectedly\r\n");
+      xSemaphoreGive(xRecordingMutex);
+    }
 
-      if(!(bits & SD_RECORDING_ACTIVE)){
-        xEventGroupSetBits(xhFilesystemEventGroup, SD_RECORDING_ACTIVE);
-        vLogMessage("Recording Started...\r\n");
+    if (bits & SD_RECORDING_CTL_BIT)
+    {
+      if(!SD_CHECKFLAGS(SD_INITIALIZED_BIT))
+      {
+        vLogMessage("SD Not Initialized, Recording Aborted\r\n");
       }else{
-        xEventGroupClearBits(xhFilesystemEventGroup, SD_RECORDING_ACTIVE);
-        vLogMessage("Stopping Recording...\r\n");
+        if (HOLDING_MUTEX(xRecordingMutex)) {                     
+            xEventGroupClearBits(xhFilesystemEventGroup, SD_RECORDING_ACTIVE);
+            xSemaphoreGive(xRecordingMutex);
+            vLogMessage("Stopping Recording...\r\n");
+        } else if (xSemaphoreTake(xRecordingMutex, 0) == pdPASS) {
+            xEventGroupSetBits(xhFilesystemEventGroup, SD_RECORDING_ACTIVE);
+            vLogMessage("Recording Started...\r\n");
+        } else {                                                 
+            vLogMessage("Recording already in progress\r\n");
+      
+        }
       }
     }
+    
     if(bits & SD_EJECT_BIT)
     {
       SD_DeInit();
@@ -847,15 +1009,22 @@ void vSDCardCTLTask(void *argument){  // Control Task for SD Card events (connec
     if(bits & SD_CONNECTION_EVENT_BIT)
     {
       vTaskDelay(pdMS_TO_TICKS(500));
-      if(BSP_SD_IsDetected() && !(bits & SD_INITIALIZED_BIT))
+      if(BSP_SD_IsDetected() && !SD_CHECKFLAGS(SD_INITIALIZED_BIT))
       {  
         vLogMessage("SD Card Connected\r\n");
         SD_Init();
-      }else if (!BSP_SD_IsDetected() && (bits & SD_INITIALIZED_BIT)){
+      }else if (!BSP_SD_IsDetected() && SD_CHECKFLAGS(SD_INITIALIZED_BIT)){
         vLogMessage("SD Card Disconnected\r\n");
         SD_DeInit();
       }
 
+    }
+
+    if(bits & SD_ERROR_REINITRQ_BIT)
+    {
+      vLogMessage("Reinitializing SD card\r\n");
+      SD_DeInit();
+      SD_Init();
     }
   }
 }
@@ -865,25 +1034,27 @@ void vSDRecordingTask(void *argument)
   FIL wavFile;
   UINT bytesWritten;
   uint32_t total_audio_bytes;
-  uint8_t ret;
-  char filename[16];
-
+  FRESULT ret;
+  char filename[64];
+  uint8_t card_ok;
+  uint8_t stopping;
   for(;;)
   {
-    xEventGroupWaitBits(xhFilesystemEventGroup, SD_RECORDING_ACTIVE, pdFALSE, pdTRUE, portMAX_DELAY);
-
-    GetNextFileName(filename);
+    xEventGroupWaitBits(xhFilesystemEventGroup, SD_RECORDING_ACTIVE | SD_INITIALIZED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
     xSemaphoreTake(xSDBusyMutex, portMAX_DELAY);
-    ret = f_open(&wavFile, filename, FA_WRITE | FA_CREATE_ALWAYS);
+    GetNextFileName(filename, sizeof(filename), recordingFolderExists ? "recordings" : "/");
+    ret = f_open(&wavFile, filename, FA_WRITE | FA_CREATE_NEW);
     xSemaphoreGive(xSDBusyMutex);
     if(ret != FR_OK)
     {
-      vLogMessage("Failed to open file %s. retSD = %d\r\n", filename, retSD );
+      vLogMessage("Failed to open file %s. retSD = %d. Requesting Reinit\r\n", filename, ret );
       xEventGroupClearBits(xhFilesystemEventGroup, SD_RECORDING_ACTIVE);
+      xEventGroupSetBits(xhFilesystemEventGroup, SD_ERROR_REINITRQ_BIT);
       continue;
     }
     vLogMessage("Creating recording %s\r\n", filename);
-
+    wavHeader.chunk_size = 0; 
+    wavHeader.data_chunk_size = 36;
     // reserve the 44-byte header; it gets rewritten with real sizes at the end
     xSemaphoreTake(xSDBusyMutex, portMAX_DELAY);
     ret = f_write(&wavFile, &wavHeader, sizeof(WAV_HeaderTypeDef), &bytesWritten);
@@ -893,48 +1064,43 @@ void vSDRecordingTask(void *argument)
       vLogMessage("Failed to write wavHeader. retSD = %d\r\n", ret);
     }
 
-    wavHeader.chunk_size = 0; 
-    wavHeader.data_chunk_size = 0;
     total_audio_bytes = 0;
+    card_ok = 1;
     while(1)
     {
-      size_t bytes = xStreamBufferReceive(xhRecordingStream, raw_audio_samples2, sizeof(raw_audio_samples2), pdMS_TO_TICKS(100));
-      if (bytes > 0)
+      if (!SD_CHECKFLAGS(SD_INITIALIZED_BIT)) 
       {
-#ifdef PROFILING
-        xTracePrint(RecordingProfiler, "f_write start");
-#endif  
+        xEventGroupClearBits(xhFilesystemEventGroup, SD_RECORDING_ACTIVE);
+        vLogMessage("Card removed, recording aborted\r\n");
+        card_ok = 0;
+        break;   // skip the header fix-up / f_close on the dead card
+      }
+      size_t bytes = xStreamBufferReceive(xhRecordingStream, raw_audio_samples2, sizeof(raw_audio_samples2), pdMS_TO_TICKS(100));
+      stopping = !SD_CHECKFLAGS(SD_RECORDING_ACTIVE);
+      if(stopping){
+        vLogMessage("Stop bit detected! Exiting recording loop.\r\n");
+      }
+      while (bytes > 0)
+      {
         xSemaphoreTake(xSDBusyMutex, portMAX_DELAY);
         ret = f_write(&wavFile, raw_audio_samples2, bytes, &bytesWritten);
         xSemaphoreGive(xSDBusyMutex);
-#ifdef PROFILING
-       xTracePrint(RecordingProfiler, "f_write stop");
-#endif
-      if (ret != FR_OK) {
-        vLogMessage("Failed to write. retSD = %d\r\n",  ret);
-      }
-        total_audio_bytes += bytesWritten;
-      }
-
-      if (!SD_CHECKFLAGS(SD_RECORDING_ACTIVE))
-      {
-        vLogMessage("Stop bit detected! Exiting recording loop.\r\n");
-        size_t rest;
-        while ((rest = xStreamBufferReceive(xhRecordingStream, raw_audio_samples2, sizeof(raw_audio_samples2), 0)) > 0)
-        {
-          xSemaphoreTake(xSDBusyMutex, portMAX_DELAY);
-          ret = f_write(&wavFile, raw_audio_samples2, rest, &bytesWritten);
-          xSemaphoreGive(xSDBusyMutex);
-          if (ret != FR_OK)
-          {
-            vLogMessage("Failed to write remaining bytes. retSD = %d\r\n", ret);
-          }
-          total_audio_bytes += bytesWritten;
+        if (ret != FR_OK) {
+          vLogMessage("Failed to write. retSD = %d\r\n",  ret);
+          card_ok = 0;
+          break;
         }
-        break;
+        
+        total_audio_bytes += bytesWritten;
+        bytes = stopping ? xStreamBufferReceive(xhRecordingStream, raw_audio_samples2, sizeof(raw_audio_samples2), 0): 0;
+      
       }
+      if(!card_ok || stopping) 
+        break;
     }
     // Fix the header size fields now that recording is finished
+    if(card_ok && SD_CHECKFLAGS(SD_INITIALIZED_BIT))
+    {
     wavHeader.data_chunk_size = total_audio_bytes;
     wavHeader.chunk_size = 36 + total_audio_bytes;
 
@@ -944,9 +1110,11 @@ void vSDRecordingTask(void *argument)
     if(ret != FR_OK)
     {
       vLogMessage("Failed to seek. retSD = %d\r\n", ret );
+      
+    }else{
+      ret = f_write(&wavFile, &wavHeader, sizeof(WAV_HeaderTypeDef), &bytesWritten);
 
     }
-    ret = f_write(&wavFile, &wavHeader, sizeof(WAV_HeaderTypeDef), &bytesWritten);
     
     if(ret != FR_OK)
     {
@@ -954,17 +1122,23 @@ void vSDRecordingTask(void *argument)
 
     }
     // Safely commit and close
-    vLogMessage( "Closing file %s with %d bytes.\r\n", filename, total_audio_bytes );
-    
+    vLogMessage( "Closing file %s with %lu bytes.\r\n", filename, total_audio_bytes );
 
-    ret = f_close(&wavFile);
-    if(ret != FR_OK)
-    {
-      vLogMessage("Failed to close file %s. retSD = %d\r\n", filename, ret );
+  }else{
+    vLogMessage("Requesting SD reinit\r\n");
+    xEventGroupSetBits(xhFilesystemEventGroup, SD_ERROR_REINITRQ_BIT);
+  }
 
-    }
-    vLogMessage("Closed file %s.\r\n", filename);
-    xSemaphoreGive(xSDBusyMutex);
+  ret = f_close(&wavFile);
+  xSemaphoreGive(xSDBusyMutex);
+  if(ret != FR_OK)
+  {
+    vLogMessage("Failed to close file %s. retSD = %d\r\n", filename, ret );
+
+  }
+  vLogMessage("Closed file %s.\r\n", filename);
+  xEventGroupClearBits(xhFilesystemEventGroup, SD_RECORDING_ACTIVE);
+
   }
 }
 
@@ -974,7 +1148,8 @@ void vLoggingTask(void *argument)
   FIL LogFile;
   FRESULT ret_open = FR_NOT_READY;
   UINT bytesWritten;
- 
+  TickType_t lastSync = xTaskGetTickCount();
+  uint8_t writePending = 0;
   for(;;)
   {
 
@@ -987,6 +1162,7 @@ void vLoggingTask(void *argument)
         xSemaphoreGive(xSDBusyMutex);
         if(ret_open != FR_OK)
         {
+          xEventGroupSetBits(xhFilesystemEventGroup, SD_ERROR_REINITRQ_BIT);
           UART_Printf("log file faled to open\r\n");
         }
       }
@@ -994,54 +1170,50 @@ void vLoggingTask(void *argument)
       ret_open = FR_NOT_READY;
     }
 
+
     if(xQueueReceive(xhLoggingQueue, Message, portMAX_DELAY) == pdPASS)
     {
       UART_Printf(Message);
-      if(ret_open == FR_OK && SD_CHECKFLAGS(SD_INITIALIZED_BIT) && !SD_CHECKFLAGS(SD_RECORDING_ACTIVE))
+      if(ret_open == FR_OK && SD_CHECKFLAGS(SD_INITIALIZED_BIT))
       {
         if(xSemaphoreTake(xSDBusyMutex, portMAX_DELAY)==pdPASS)
         {
           if(f_write(&LogFile, Message, strlen(Message), &bytesWritten) != FR_OK)
           {
             vLogMessage("f_write failed in Logging Task\r\n");
-          }else{
-            f_sync(&LogFile);
           }
+          writePending = 1;
           xSemaphoreGive(xSDBusyMutex);
         }else{
           vLogMessage("SD Busy, failed to write message\r\n");
         }
-        
-        
       }
-
-      
       xSemaphoreTake(xLoggingSemaphore, portMAX_DELAY);
-
     }
+    if(((xTaskGetTickCount() - lastSync) >= pdMS_TO_TICKS(1000)) && writePending)
+    {
+      if (xSemaphoreTake(xSDBusyMutex, 10) == pdPASS)
+      {
+        f_sync(&LogFile);
+        writePending = 0;
+        lastSync = xTaskGetTickCount();
+        xSemaphoreGive(xSDBusyMutex);
+      }
+      
+    }
+    
   }
 }
 void HAL_SAI_RxHalfCpltCallback(SAI_HandleTypeDef *hsai){
   BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-
-  xQueueSendFromISR(xhAudioQueue, &DMA_buf[0], &xHigherPriorityTaskWoken);
+  xTaskNotifyFromISR(AudioProcessingTaskHandle, 1, eSetValueWithOverwrite, &xHigherPriorityTaskWoken);
   portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
 void HAL_SAI_RxCpltCallback(SAI_HandleTypeDef *hsai){
   BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-
-  xQueueSendFromISR(xhAudioQueue, (DMA_buf+AUDIO_BLOCK_LEN_WORDS), &xHigherPriorityTaskWoken);
+  xTaskNotifyFromISR(AudioProcessingTaskHandle, 2, eSetValueWithOverwrite, &xHigherPriorityTaskWoken);
   portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
-}
-
-void traceTaskSwitch(void)
-{
-  uint8_t buf1[50];
-  BSP_LED_Toggle(LED_GREEN);
-
-  snprintf((char*)buf1, sizeof(buf1), "Current Task: %s\r\n", pcTaskGetTaskName(NULL));
-  HAL_UART_Transmit(&huart2, buf1, strlen((char*)buf1), HAL_MAX_DELAY);
 }
 
 uint8_t BSP_SD_IsDetected(void)
@@ -1138,11 +1310,10 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 __weak void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
-  osThreadExit();
   /* Infinite loop */
   for(;;)
   {
-    osDelay(1);
+    osDelay(osWaitForever);
   }
   /* USER CODE END 5 */
 }

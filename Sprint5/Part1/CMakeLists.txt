@@ -45,7 +45,7 @@ set(TRACERECORDER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/TraceRecorder)
 
 file(GLOB TRACERECORDER_SOURCES
     "${TRACERECORDER_DIR}/*.c"
-    "${TRACERECORDER_DIR}/streamports/RingBuffer/*.c" # Choose your streamport
+    "${TRACERECORDER_DIR}/streamports/Jlink_RTT/*.c" # Choose your streamport
 )
 
 # Add sources to executable
@@ -59,16 +59,16 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
     ${CMAKE_CURRENT_SOURCE_DIR}/TraceRecorder/include
     ${CMAKE_CURRENT_SOURCE_DIR}/TraceRecorder/config
-    ${CMAKE_CURRENT_SOURCE_DIR}/TraceRecorder/streamports/RingBuffer/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/TraceRecorder/streamports/RingBuffer/config
+    ${CMAKE_CURRENT_SOURCE_DIR}/TraceRecorder/streamports/Jlink_RTT/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/TraceRecorder/streamports/Jlink_RTT/config
 
 )
 target_include_directories(stm32cubemx INTERFACE
     # Add user defined include paths
     ${CMAKE_CURRENT_SOURCE_DIR}/TraceRecorder/include
     ${CMAKE_CURRENT_SOURCE_DIR}/TraceRecorder/config
-    ${CMAKE_CURRENT_SOURCE_DIR}/TraceRecorder/streamports/RingBuffer/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/TraceRecorder/streamports/RingBuffer/config
+    ${CMAKE_CURRENT_SOURCE_DIR}/TraceRecorder/streamports/Jlink_RTT/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/TraceRecorder/streamports/Jlink_RTT/config
 
 )
 # Add project symbols (macros)

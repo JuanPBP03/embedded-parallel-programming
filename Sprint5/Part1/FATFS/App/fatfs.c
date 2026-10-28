@@ -61,14 +61,14 @@ DWORD get_fattime(void)
 }
 
 /* USER CODE BEGIN Application */
-void GetNextFileName(char *filename)
+void GetNextFileName(char *filename, size_t len, const TCHAR *path)
 {
   static DIR rootdir __attribute((aligned(4)));
   static FILINFO info __attribute((aligned(4)));
   FRESULT res;
   uint8_t max_num = 0;
 
-  res = f_opendir(&rootdir, "/");
+  res = f_opendir(&rootdir, path);
     if (res == FR_OK) 
     {
         while (1) 
@@ -104,6 +104,9 @@ void GetNextFileName(char *filename)
         }
         f_closedir(&rootdir); // Always close directories to release internal FatFs handles
     }
-    sprintf(filename, "REC_%03d.WAV", (max_num+1));
+  if (path[0] == '\0' || strcmp(path, "/") == 0)
+      snprintf(filename, len, "REC_%03d.WAV", max_num + 1);
+  else
+      snprintf(filename, len, "%s/REC_%03d.WAV", path, max_num + 1); 
 }
 /* USER CODE END Application */

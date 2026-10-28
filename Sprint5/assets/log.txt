@@ -1,0 +1,16 @@
+[SD Control Tick:300788]   FILE log.txt
+[SD Control Tick:300788]   FILE REC_001.WAV
+[SD Control Tick:300789]   DIR  recordings
+[SD Control Tick:300793]   FILE REC_002.WAV
+[SD Control Tick:300793]   FILE REC_003.WAV
+[SD Control Tick:300793]   FILE REC_004.WAV
+[SD Control Tick:300801] (total: 2 dirs, 5 files)
+[SD Control Tick:300801] --------
+[SD Control Tick:300801] SD Initialization Done!
+[FFT Processing Tick:310564] Detected Southeastern Field Cricket: -85.68 dBFS
+[FFT Processing Tick:310565] Cricket detected, recording started
+[SD Recording Tick:310592] Creating recording recordings/REC_032.WAV
+[FFT Processing Tick:310935] Detected Fall Field Cricket: -81.33 dBFS
+[SD Control Tick:320783] Recording already in progress
+[SD Control Tick:322334] Recording already in progress
+[FFT Processing Tick:325935] Lost Fall Field Cricket: -106.32 dBFS. Last detected: 323925

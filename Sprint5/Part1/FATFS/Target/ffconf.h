@@ -204,7 +204,7 @@
 / System Configurations
 /----------------------------------------------------------------------------*/
 
-#define _FS_TINY    1      /* 0:Normal or 1:Tiny */
+#define _FS_TINY    0      /* 0:Normal or 1:Tiny */
 /* This option switches tiny buffer configuration. (0:Normal or 1:Tiny)
 /  At the tiny configuration, size of file object (FIL) is reduced _MAX_SS bytes.
 /  Instead of private sector buffer eliminated from the file object, common sector
@@ -242,7 +242,7 @@
 #define _FS_REENTRANT    1  /* 0:Disable or 1:Enable */
 
 #define _USE_MUTEX       1 /* 0:Disable or 1:Enable */
-#define _FS_TIMEOUT      100 /* Timeout period in unit of time ticks */
+#define _FS_TIMEOUT      500 /* Timeout period in unit of time ticks */
 #define _SYNC_t          osMutexId_t
 /* The option _FS_REENTRANT switches the re-entrancy (thread safe) of the FatFs
 /  module itself. Note that regardless of this option, file access to different
